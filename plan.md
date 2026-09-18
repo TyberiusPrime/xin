@@ -61,15 +61,13 @@ This is common in scientific analysis, e.g. when a parameter change
 does not lead to an output change, or a software update does not affect
 a particular run. 
 
-We can't save having to recalculate node X once when it's inputs
+We can't save having to recalculate / redownload node X once when it's inputs
 change, but we can skip recalculating downstreams if it's outputs do not.
 
 ## A2
 
 External data comes in via Fixed Output Derivations (FOD), which we treat as
-trust-on-first-use (TOFU). The TOFU hashes must be stored back into the build
-configuration, so communicating them back to the (not yet designed) DAG
-definition frontend is necessary.
+trust-on-first-use (TOFU).
 
 TOFU mismatches are immediate build failures. We keep the output (until next gc),
 but do not update the input->output matching.
@@ -79,6 +77,11 @@ There is no 'no-input' node that is not a Fixed Output Derivation.
 But the nodes are not just an url + the supposed output hash. 
 They also need a fetcher (fetchurl, fetchzip, fetchFromGithub...)
 
+ The TOFU hashes must be stored back into the build
+configuration, so communicating them back to the (not yet designed) DAG
+definition frontend is necessary. We might use a temporary lock file for this,
+but the lock file won't be the user facing interface, nix makes the right 
+choice of keeping the definitions and the hashes together.
 
 ## A3.
 Like nix we distinguish between built time and run-time dependencies.
@@ -101,6 +104,12 @@ stores the user explicitly trusts / opts in on (think lab-shared
 download proxies / data access systems) can provide TOFU input->output hashes,
 which then becomes 'trust the remote store'.
 
+That means for 'local remote store', we place 
+symlinks in the local store. Yes, that affects relocability of 
+those other remote stores. If that becomes a real world issue, we'll 
+add in a 'rewrite symlinks that point to /some/other/store to /new/place/of/other/store'
+command.
+
 
 ## A5
 Remote stores (=not machine local) can supply 
@@ -120,12 +129,13 @@ We need also a way to decide policy on 'remote stores disagree
 on input->output mapping' - for the first version that's a build failure for that node,
 and requires blacklisting it's input hash for one (or all) remote stores to get around.
 
-
-
-
 ##  A6
 
 During build, we must tell the store which paths not to GC right now.
+
+That means we need to protect them regardless of their existence, 
+to not run into 'time of check, time of declaration, time of use'
+discrepancies.
 
 ## A7
 Implementation of the resolver is in Rust, and will be 
@@ -140,17 +150,27 @@ Some of which are marked as 'must be realized at the end' (=targets).
 At the end of the algorithm, the targets will be present in one of the local stores,
 and their runtime-closures will be present, and we will have learned
 the input->output mapping of every node in their build-time closure.
-
-So an individual node has states (subset): 
-'Unresolved -> Resolved (=output-hash known) ->
-Present (name known, bytes on disk) -> Realized (previous + run-time-closure also realized)'.
+Or we have failures that prevent the targets from being build, 
+and have causal annotation for what happened.
 
 During the link naming, DAG entries might virtually collapse (due to same output hash),
 but that can not introduce cycles, since we don't 'merge' the nodes - we just
 treat both of them as 'present, output name is <hash>'.
 
+So each node has at least these somewhat independent state axes:
+(everything subject to more details...)
+
+Named: not-named-yet, input named, output named
+Bytes available: not-yet-known, In-local-store-<xyz>, being-build, being-downloaded,
+Remote store availability: not-yet-known, output-hash available in which stores
+Runtime-closure local available: yes, unknown, missing-the-following
+outcome: Present. Named (presence not required). Failed (FetchFailed, BuildFailed,
+tofu mismatch, upstream-failed <upstream-human-name>...)
+
+
 To begin prune the graph down to the upstream closures of the targets,
 then start filling in names from the roots. 
+
 All roots without input are fixed output derivation. 
 For TOFU that means we can discover their output names by downloading (if not yet stored).
 For non-tofu that means we need them before hand.
@@ -158,6 +178,7 @@ For non-tofu that means we need them before hand.
 We then go down, repeatedly querying the stores (local & remote)
 for input->output mappings (and output presence), and then 
 either building or copying from remote stores what we need.
+
 But we can only build once all build-time dependencies are realized.
 And after downloading, we can discover that we need runtime-dependencies
 that we have skipped so far, since we already had names for them from the remote.
@@ -167,14 +188,13 @@ This loop eventually terminates, since it's not generating new nodes, just pushi
 existing nodes from 'we need to name this' into 'we need to realize this'. Limited
 in scope.
 
-
 We symlink the targets in an 'results' folder (with human names) as they 
 are produced. (The out-of-scope DAG definition is responsible for not having
 producing collisions in the human names - the resolver is free to 
 apply it's failure policy if that happens)
 
 It's a whole dance, with lot's of (partial) failures that can occur, 
-and this will require exhaustive enums and fuzzying to get robust.
+and this will require exhaustive enums and deterministic simulation (+- fuzzying) to get robust.
 
 Also we need to support at least two failure policies: keep-going & fail fast.
 Remote retry configuration etc will be secondary. 
@@ -185,9 +205,27 @@ Conflicting information from stores on input->output mapping:
 build failure. Ability to blacklist mappings for individual remote stores 
 necessary. That allows local rebuild.
 
+Even if the remote store is blacklisted, we should loudly log that, 
+and record the discrepancy in the meta output.
+
 ## A9
-Hashing: Input hash-of-hashes and output-hashes should be visible distinct
-(prefix?). 
+Hashing: Input hash-of-hashes and output-hashes should be visible distinct.
+We'll use the last byte appended to hashes for this, and encoding 
+a hash version as well. Can't use lower/upper case bits (some file systems
+are still case insensitive...), but that still means we get at least 32 letters
+(RFC4648 base32 alphabet), so we can encode a hash-version/algorithm into that.
+
+(Suffix instead of prefix since sharding would be greatly diminished.
+
+Let's Tie this down:
+B -> output hash, hashing version 1
+A -> input-hashes,  hashing version 1
+
+D -> output hash, hashing version 2 (which we don't have yet)
+C -> input-hashes,  hashing version 2
+
+(so 'input before output', later letters -> larger values),
+and uppercase to visually split it from the actual hash.
 
 ## A10
 
@@ -202,6 +240,12 @@ I don't think we can do speculative queries to the remotes though.
 And since we record every mapping it's only going to be an issue on first
 build, and scientific endeavor's are all about 'tweak parameters, run again'
 anyway.
+
+We also need 'negative-result caching' with TTL for the remotes, 
+to prevent asking them repeatedly. And we should be able to
+tell each DAG node what remote might actually have it - no point
+querying 'software' upstreams for our specific datasets.
+
 
 ## A11 
 The fuzzing must fuzz failing builders, downloaders etc.
@@ -224,6 +268,56 @@ Copy them there when building the output-cas though).
 Event driven design. Throwing out a build, by subprocess, or by 'submitting it 
 to some kind of scheduler' should be supported.
 
+## A14
+Are multiple outputs per node worth it?
+They do complicate the resolver, and they can be simulated 
+by the upstream creating one node that writes everything, and then 
+downstreams that symlink into that.
+So: No, one output per node. 
+
+
+## C1
+
+Input hashing.
+Use Blake3 for now.
+
+Briefly, the idea is that they depend on (the-hash-of-) a mapping 
+{name => output-hash-of-input-node}, and 
+a second mapping with 'special inputs'.
+
+Special inputs are e.g. the build script,
+the build command, env variables, maybe architecture,
+for TOFU: url & fetcher.
+
+For the resolver, the special inputs are a an opaque value,
+while the input's output-hashes come resolving upstream nodes.
+
+For TOFU nodes the fetcher will be such a special input.
+The URL will be a 'special' input as well - because 'changed the URL but left 
+the TOFU hash the same' is one of the most annoying nix footguns. 
+
+Format:
+Simple line based format, with separator between the mappings.
+mapping names sorted.
+Format:
+```
+output-hash:nameA
+output-hash:nameB
+--
+value-hash:hash-of-buildScript
+value-hash:hash-of-env_vars
+```
+env_vars: sort, stringify (bash syntax), hash.
+other special inputs: hash their bytes.
+
+
+This insulates nodes from their changes in their grand+-parents,
+iff their parents do not change.
+
+The trade-off is that we do not have the whole build graph
+named before we start, but discover what nodes correspond to which output folders
+and input->output mappings incrementally.
+
 # Design decisions that the resolver itself does not care about.
 
 ## B1
@@ -233,25 +327,11 @@ Secondary lint to verify runtime inputs - we need symlinks to be
 relative ../runtime-inputs/name, or ../../<output-hash>, not 
 /xin/<whatever>.
 
-To make this more robust, it might be a good idea to randomize 
-the '/xin' part during builds.
+To make this more robust, we'll randomize
+the '/xin' part during builds. This helps with finding accidentally
+embedded absolute paths.
 
-Nodes depend on exactly the content-addresses of it's named input nodes (
-input-hash = hash-of-hashes). 
-There is one 'special' input, the build-script. 
-(possibly there will be more special inputs, such as the
-container system used, architecture - but the later should be a non issue
-since different architectures by necessity have some very basic bootstrap
-node difference).
-
-Env Vars, parameters are part of the build script.
-
-This insulates nodes from their changes in their grand+-parents,
-iff their parents do not change.
-
-The trade-off is that we do not have the whole build graph
-named before we start, but discover what nodes correspond to which output folders
-and input->output mappings incrementally.
+Nodes depend on a yet to be formalized description of their inputs.
 
 
 ## B2
@@ -314,10 +394,9 @@ just fine to answer questions like 'when was this build'.
 
 Build logs & statistics are also not considered part of the output.
 
-Builds happen in store/temp/<pid>/<timestamp> (pid reuse within 1/2s seems
-unlikely), and get placed into their final destination atomically by rename,
+Builds happen in store/temp/<mkdtemp name> and get placed into their final destination atomically by rename,
 after canonicalization. ENOTEMPTY is ok, that's a parallel build that was
-faster. Don't forget fsyncs.
+faster. Don't forget fsyncs. needs a reaping policy for crashed builds?
 
 Failed builds stick around in a special store folder for inspection
 - maybe for a couple of invocations, but no longer than the next gc?
@@ -325,6 +404,7 @@ Failed builds stick around in a special store folder for inspection
 Concurrent builds are additive, worst case is a wasted compute.
 (If your jobs need 10 hours of compute to find you did them twice 
 in different graphs: You need to split your jobs better).
+
 
 ## B6.
 Shared (machine local) stores are trusted by default, users must share group,
@@ -356,16 +436,19 @@ No point in doing all the hard work just to get something of the ground.
 It's a special builder (so not the regular containerized script),
 in which nix store input node get's converted into a (local) store
 entry by copying into /payload & ammending with the runtime-input-symlinks
-(which is a local scan during the 'build' step, not a global scan-for-references
-mechanism).
+(which is a query to 'nix path-info --json')
 
 (That means we need a preprocessing step that expands a nix store-path
-into the local dag of it's runtime closure, and then they get 'build'/imported step by step).
+into the local DAF of it's runtime closure, and then they get 'build'/imported step by step).
 
 And it also means that nix-store-import is a special kind of build, not containerized,
 nor TOFUed, since it needs to see /nix/store from the outside world.
 
 We then map these back into our containers at /nix/store .
+
+Note that the references might only work inside the container, 
+outside of the container nix might GC those paths. Won't affect our builds
+- we got our copy, but needs special handling during export.
 
 ## B9
 Primary interface will be a single 'xin' command with subcommands.
@@ -413,15 +496,23 @@ the hashes here are more about provenance then efficiency.
 Needs a literature search maybe there's a highly unpacked byte identical archive format 
 nowadays.
 
+Hashes are encoded in padding-less RCF4648 Base32, lowercased, with
+an additional version/type suffix (see A9).
+
 
 ## B13
 No-copy ingestion of datasets. Somewhat similar to our nix-store ingestion.
-One the one hand, trivial, just place a symlink in the store instead of a folder.
+One the one hand, trivial, just place a symlink in the store instead of a folder,
+and bind mount them into the containers.
 
 Problem: provenance, hash tracking, protection / detection of changed files?
 I mean , inode + timestamp + size go far and should protect against all
 accidental changes (which then lead to TOFU failure and build abort).
 But we need to store them somewhere. Active manipulation we can't defend against anyway.
+
+(This isn't meant for NFS/Lustre style sharing. Those systems have much less
+of an inode concept, and mtime granularity is bad. Will it still work if we just
+track timestamp & size. Probably. But advise users against this, I suppose).
 
 What about 'changing during build'. It's a niche case, could be caught with
 before/after hashing. Then what, tofu failure? We'd notice on a rerun 
@@ -465,5 +556,30 @@ policy) for verification.
 ## B20
 Viewing outside of containers is unsolved right now. We might do something creative
 with FUSE, or looka ta Spack and conda (shudder)
+
+## B21
+S3 and stuff. TOfU nodes, local copy, GC policy. Nothing special beyond
+mayhaps a fetcher.
+
+
+# Prototype development
+
+
+The heart & core is of course the state machine per node, and the
+set of events, and the 'drive evaluation forward' algorithm.
+
+Mocking every IO with traits, and having complex enough mockers
+should allow us to use deterministic simulation testing 
+in addition to individual unit & behavior tests.
+
+This is vital, our last voyage into this space (pypipegraph2) nearly
+failed because it was so difficult to get the evaluation right.
+We're in better shape here (on 'temporary' jobs, better concept), 
+but wary.
+
+Crates to consider for deterministic simulation testing madsim, turmoil.
+Perhaps proptest for DAG generation. 
+
+
 
 
