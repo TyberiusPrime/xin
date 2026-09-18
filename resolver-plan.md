@@ -164,7 +164,7 @@ struct StoreQuery {
 
 trait QueryStore
 {
-    async fn query_inputs(input_hashes: Vec<InputHash>) -> Vec<QueryResult>
+    fn query_inputs(input_hashes: Vec<InputHash>) -> Vec<QueryResult>
 
 }
 struct QueryResult {
@@ -181,7 +181,7 @@ enum BuilderType {
 }
 //fetchers are also builders.
 trait Builder {
-    async fn build_process(
+    fn build_process(
         local_store: QueryStore,
         recipe: Vec<u8>,
     ) -> NodeBuildOutcome
