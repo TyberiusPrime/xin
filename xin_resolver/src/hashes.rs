@@ -27,11 +27,21 @@ impl InputHash {
     pub fn of(data: &[u8]) -> Self {
         InputHash(hash_bytes(data))
     }
+
+    /// Inverse of `Display` (52 base32 chars + the 'A' marker).
+    pub fn parse(s: &str) -> Option<InputHash> {
+        parse_hash(s, INPUT_V1_MARKER).map(InputHash)
+    }
 }
 
 impl OutputHash {
     pub fn of(data: &[u8]) -> Self {
         OutputHash(hash_bytes(data))
+    }
+
+    /// Inverse of `Display` (52 base32 chars + the 'B' marker).
+    pub fn parse(s: &str) -> Option<OutputHash> {
+        parse_hash(s, OUTPUT_V1_MARKER).map(OutputHash)
     }
 }
 
@@ -59,6 +69,33 @@ const INPUT_V1_MARKER: char = 'A';
 const OUTPUT_V1_MARKER: char = 'B';
 
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+fn decode_base32(s: &str) -> Option<Vec<u8>> {
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    for c in s.bytes() {
+        let v = BASE32.iter().position(|&b| b == c)? as u32;
+        acc = (acc << 5) | v;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    // the padding bits of the final character must be zero
+    if bits > 0 && acc & ((1 << bits) - 1) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+fn parse_hash(s: &str, marker: char) -> Option<[u8; HASH_LEN]> {
+    if s.len() != 53 || !s.ends_with(marker) {
+        return None;
+    }
+    decode_base32(&s[..52])?.try_into().ok()
+}
 
 fn push_base32(bytes: &[u8], out: &mut String) {
     let mut acc: u32 = 0;
@@ -124,6 +161,21 @@ mod tests {
         let s = oh.to_string();
         assert!(s.starts_with("7777"));
         assert!(s.ends_with('B'));
+    }
+
+    #[test]
+    fn parse_roundtrip() {
+        let oh = OutputHash::of(b"some bytes");
+        assert_eq!(OutputHash::parse(&oh.to_string()), Some(oh));
+        let ih = InputHash::of(b"other bytes");
+        assert_eq!(InputHash::parse(&ih.to_string()), Some(ih));
+        // wrong marker, wrong length, bad characters
+        assert_eq!(OutputHash::parse(&ih.to_string()), None);
+        assert_eq!(OutputHash::parse("tooshortB"), None);
+        assert_eq!(
+            OutputHash::parse(&format!("{}!", &oh.to_string()[..52])),
+            None
+        );
     }
 
     #[test]
