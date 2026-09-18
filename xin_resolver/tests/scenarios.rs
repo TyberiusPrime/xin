@@ -9,7 +9,7 @@ use xin_resolver::input::{
     BuilderType, Cores, HumanName, InputName, RawInput, RawNode, StoreDef, StoreName,
     ValidRemoteStores,
 };
-use xin_resolver::sim::{BuildScript, SimWorld, drive, sim_output_for};
+use xin_resolver::sim::{BuildScript, Policy, SimWorld, drive, drive_policy, sim_output_for};
 use xin_resolver::{NodeStatus, Outcome, Resolver};
 
 fn hn(s: &str) -> HumanName {
@@ -161,6 +161,9 @@ fn substitution_with_runtime_closure_expansion() {
     assert_eq!(*status(&r, &out, "a"), NodeStatus::Named { output: oh_a });
     // …but its bytes are local, pulled in through b's runtime closure
     assert!(w.store(&sn("primary")).outputs.contains_key(&oh_a));
+    // A12: mappings learned from the remote were written back locally
+    assert_eq!(w.store(&sn("primary")).mappings.get(&ih_a), Some(&oh_a));
+    assert_eq!(w.store(&sn("primary")).mappings.get(&ih_b), Some(&oh_b));
 }
 
 #[test]
@@ -189,6 +192,9 @@ fn early_cutoff_names_without_realizing() {
     assert_eq!(w.downloads_run, 1);
     assert_eq!(*status(&r, &out, "a"), NodeStatus::Named { output: oh_a });
     assert!(!w.store(&sn("primary")).outputs.contains_key(&oh_a));
+    // A12: even the bytes-less mapping fact was persisted locally
+    assert_eq!(w.store(&sn("primary")).mappings.get(&ih_a), Some(&oh_a));
+    assert_eq!(w.store(&sn("primary")).mappings.get(&ih_b), Some(&oh_b));
 }
 
 #[test]
@@ -338,5 +344,121 @@ fn confluence_across_seeds() {
             *fp, fingerprints[0],
             "end conditions must not depend on the schedule"
         );
+    }
+}
+
+#[test]
+fn substituted_closure_escape_is_detected() {
+    // §8: b's remote mapping claims a runtime ref that is not inside b's
+    // build closure ({a's output}) — the offending store's claim fails the
+    // node instead of silently pulling foreign bytes
+    let raw = with_remotes(
+        vec![
+            ("a", node("A", &[], false)),
+            ("b", node("B", &[("a", "a")], true)),
+        ],
+        &["remote"],
+    );
+    let ih_a = input_hash_of(&[], b"A");
+    let oh_a = sim_output_for(ih_a); // a is built locally: no store knows it
+    let ih_b = input_hash_of(&[("a", oh_a)], b"B");
+    let oh_b = OutputHash::of(b"remote-b");
+    let oh_evil = OutputHash::of(b"not-in-any-closure");
+    let (r, _w, out) = run(raw, 21, |_, w| {
+        let s = w.store_mut(&sn("remote"));
+        s.mappings.insert(ih_b, oh_b);
+        s.outputs.insert(oh_b, BTreeSet::from([oh_evil]));
+    });
+    assert!(!out.success);
+    let NodeStatus::Failed { failure } = status(&r, &out, "b") else {
+        panic!()
+    };
+    let rec = &out.failures[failure.idx()];
+    assert_eq!(rec.kind, FailureKind::ClosureEscape);
+    assert_eq!(rec.origin, Origin::Node(r.dag.id_of("b").unwrap()));
+}
+
+#[test]
+fn contradicting_refs_claim_fails_the_output() {
+    // the remote claims refs {base} in its presence answer but the fetched
+    // tree declares {} — a CAS object has exactly one ref set, so a
+    // disagreeing source is lying or corrupt
+    let raw = with_remotes(
+        vec![
+            ("base", node("B", &[], false)),
+            ("a", node("A", &[("base", "base")], true)),
+        ],
+        &["remote"],
+    );
+    let ih_base = input_hash_of(&[], b"B");
+    let oh_base = sim_output_for(ih_base);
+    let ih_a = input_hash_of(&[("base", oh_base)], b"A");
+    let oh_a = OutputHash::of(b"remote-a");
+    let (r, _w, out) = run(raw, 23, |_, w| {
+        let s = w.store_mut(&sn("remote"));
+        s.mappings.insert(ih_a, oh_a);
+        s.outputs.insert(oh_a, BTreeSet::new());
+        s.claim_overrides.insert(oh_a, BTreeSet::from([oh_base]));
+    });
+    assert!(!out.success);
+    let NodeStatus::Failed { failure } = status(&r, &out, "a") else {
+        panic!()
+    };
+    let rec = &out.failures[failure.idx()];
+    assert_eq!(rec.kind, FailureKind::NonDeterminism);
+    assert_eq!(rec.origin, Origin::Output(oh_a));
+}
+
+/// §7's fail-fast property: under every schedule, the fact set is a subset
+/// of the keep-going run's and no fact contradicts it; every lease is
+/// released; the originating failure is still reported.
+#[test]
+fn fail_fast_facts_are_a_consistent_subset() {
+    let scenario = || {
+        local_only(vec![
+            ("doomed", node("X", &[], true)),
+            ("c1", node("C1", &[], false)),
+            ("c2", node("C2", &[("c1", "c1")], false)),
+            ("c3", node("C3", &[("c2", "c2")], true)),
+        ])
+    };
+    let fail_doomed = |r: &Resolver, w: &mut SimWorld| {
+        w.builds.insert(
+            r.dag.id_of("doomed").unwrap(),
+            BuildScript::Fail {
+                stderr: "no".into(),
+            },
+        );
+    };
+    let (kg_r, kg_w, kg_out) = run(scenario(), 1, fail_doomed);
+    assert!(!kg_out.success);
+    assert!(matches!(
+        *status(&kg_r, &kg_out, "c3"),
+        NodeStatus::Realized { .. }
+    ));
+
+    for seed in 0..16 {
+        let dag = scenario().ingest().unwrap();
+        let mut r = Resolver::new(dag);
+        let mut w = SimWorld::new(&r.dag);
+        fail_doomed(&r, &mut w);
+        let out = drive_policy(&mut r, &mut w, seed, Policy::FailFast);
+        assert!(!out.success);
+        for (ih, (oh, _)) in &r.knowledge.facts {
+            assert_eq!(
+                kg_r.knowledge.facts.get(ih).map(|(o, _)| o),
+                Some(oh),
+                "fail-fast learned a fact the keep-going run does not agree with"
+            );
+        }
+        for (ih, oh) in &w.store(&sn("primary")).mappings {
+            assert_eq!(kg_w.store(&sn("primary")).mappings.get(ih), Some(oh));
+        }
+        assert!(w.builds_run <= kg_w.builds_run);
+        assert!(w.leases.is_empty(), "cancellation must release every lease");
+        let NodeStatus::Failed { failure } = status(&r, &out, "doomed") else {
+            panic!("the originating failure must always be reported")
+        };
+        assert_eq!(out.failures[failure.idx()].kind, FailureKind::Build);
     }
 }

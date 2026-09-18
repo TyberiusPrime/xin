@@ -4,16 +4,17 @@
 //! (§4): no HashMap iteration, all tie-breaks by stable rank (NodeId /
 //! store definition order), decisions only on complete answer waves.
 //!
-//! A `(state, event)` pair the core does not expect is a bug and panics
-//! with a message naming both — the M3 transition-table harness will
-//! enumerate these systematically.
+//! `apply` consults the transition table (`transitions`) before
+//! dispatching: a (request, event) pair or (request, state) observation
+//! outside the table is a bug and panics citing it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::mem;
 
 use crate::events::{
-    BuildOutcome, CommitResult, DownloadOutcome, Effect, Event, Inflight, LeaseId, PresenceAnswer,
-    RequestId,
+    BuildOutcome, CommitResult, DownloadOutcome, Effect, Event, Inflight, LeaseId, Presence,
+    PresenceAnswer, RequestId,
 };
 use crate::failure::{FailureDetail, FailureId, FailureKind, FailureRecord, Origin};
 use crate::hashes::{InputHash, OutputHash, input_hash_of};
@@ -22,6 +23,7 @@ use crate::state::{
     BuildPhase, Demand, DownloadPhase, Mapping, MappingSource, MappingState, NodeSlot, Realization,
     RealizationState, Reason, StoreKnowledge,
 };
+use crate::transitions::{self, Classification};
 
 pub struct Resolver {
     pub dag: Dag,
@@ -32,6 +34,9 @@ pub struct Resolver {
     pub inflight: BTreeMap<RequestId, Inflight>,
     pub failures: Vec<FailureRecord>,
     next_tok: u64,
+    /// the host has cancelled at least one request (fail-fast drain);
+    /// quiescence may then legitimately leave entries parked mid-machine
+    saw_cancel: bool,
 }
 
 /// Human-facing per-node end state (A7's end conditions).
@@ -48,6 +53,8 @@ pub enum NodeStatus {
     Failed {
         failure: FailureId,
     },
+    /// resolution was cut short by host cancellation (fail-fast)
+    Incomplete,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +84,27 @@ impl Outcome {
             out.push(cur);
         }
         out
+    }
+}
+
+/// Where a set of runtime refs was learned — for blame in §8 failures.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum RefsSource {
+    Built,
+    LocalStore(StoreName),
+    /// a remote's availability claim (pre-download)
+    Claim(StoreName),
+    Download(StoreName),
+}
+
+impl fmt::Display for RefsSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefsSource::Built => write!(f, "the local build"),
+            RefsSource::LocalStore(s) => write!(f, "local store {s}"),
+            RefsSource::Claim(s) => write!(f, "availability claim by {s}"),
+            RefsSource::Download(s) => write!(f, "download from {s}"),
+        }
     }
 }
 
@@ -118,6 +146,7 @@ impl Resolver {
             inflight: BTreeMap::new(),
             failures: Vec::new(),
             next_tok: 0,
+            saw_cancel: false,
         }
     }
 
@@ -137,6 +166,19 @@ impl Resolver {
 
     /// Total over everything a well-behaved host can send. No IO, no clock.
     pub fn apply(&mut self, ev: Event) -> Vec<Effect> {
+        let tok = ev.tok();
+        let kind = self
+            .inflight
+            .get(&tok)
+            .unwrap_or_else(|| panic!("bug: {:?} for unknown token {tok:?}", ev.kind()))
+            .kind();
+        match transitions::classify(kind, ev.kind()) {
+            Classification::Expected | Classification::CancelOk => {}
+            Classification::Impossible(reason) => {
+                panic!("bug: {kind:?} answered by {:?} — {reason}", ev.kind())
+            }
+        }
+        self.check_state_legality(tok);
         let mut fx = Vec::new();
         match ev {
             Event::MappingAnswered { tok, output } => {
@@ -154,8 +196,52 @@ impl Resolver {
             Event::MappingCommitted { tok, result } => {
                 self.on_mapping_committed(tok, result, &mut fx)
             }
+            Event::Cancelled { tok } => self.on_cancelled(tok, &mut fx),
         }
         fx
+    }
+
+    /// The state half of the transition table: the entry a token points at
+    /// must be in one of the states the table pins it to.
+    fn check_state_legality(&self, tok: RequestId) {
+        let infl = &self.inflight[&tok];
+        let kind = infl.kind();
+        match infl {
+            Inflight::MappingQuery { input, .. }
+            | Inflight::BuildLease { input }
+            | Inflight::Build { input }
+            | Inflight::BuildOutputCommit { input }
+            | Inflight::BuildMappingCommit { input }
+            | Inflight::MappingWriteBack { input } => {
+                let state = &self
+                    .mappings
+                    .get(input)
+                    .expect("bug: token for unknown mapping")
+                    .state;
+                let legal = transitions::legal_mapping_states(kind).unwrap();
+                assert!(
+                    legal.contains(&state.kind()),
+                    "bug: {kind:?} outstanding while its mapping is {:?}; table pins it to {legal:?}",
+                    state.kind()
+                );
+            }
+            Inflight::PresenceQuery { output, .. }
+            | Inflight::DownloadLease { output }
+            | Inflight::Download { output }
+            | Inflight::DownloadCommit { output } => {
+                let state = &self
+                    .realizations
+                    .get(output)
+                    .expect("bug: token for unknown realization")
+                    .state;
+                let legal = transitions::legal_realization_states(kind).unwrap();
+                assert!(
+                    legal.contains(&state.kind()),
+                    "bug: {kind:?} outstanding while its realization is {:?}; table pins it to {legal:?}",
+                    state.kind()
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -254,12 +340,12 @@ impl Resolver {
         fx: &mut Vec<Effect>,
     ) {
         let Inflight::MappingQuery { store, input: ih } = self.take_inflight(tok) else {
-            panic!("bug: MappingAnswered for a non-mapping-query token");
+            unreachable!()
         };
         {
             let m = self.mappings.get_mut(&ih).unwrap();
             let MappingState::Querying { pending, answers } = &mut m.state else {
-                panic!("bug: mapping answer in state {:?}", m.state);
+                unreachable!()
             };
             assert!(pending.remove(&store), "bug: duplicate answer from {store}");
             if let Some(oh) = output {
@@ -294,7 +380,30 @@ impl Resolver {
             return;
         }
         let oh = *distinct.iter().next().unwrap();
-        self.resolve_mapping(ih, oh, MappingSource::Substituted, fx);
+        let src_store = answers
+            .iter()
+            .min_by_key(|(s, _)| self.store_rank(s))
+            .unwrap()
+            .0
+            .clone();
+        let local_positive = answers
+            .iter()
+            .any(|(s, _)| matches!(self.dag.stores[s], StoreDef::Local { .. }));
+        self.resolve_mapping(ih, oh, MappingSource::Substituted(src_store), fx);
+        if !local_positive && !matches!(self.mappings[&ih].state, MappingState::Failed(_)) {
+            // A12: a learned fact becomes an on-disk record immediately —
+            // write the mapping into the producing node's target store
+            let target = self.dag.nodes[self.mappings[&ih].nodes[0].idx()]
+                .target_store
+                .clone();
+            let tok = self.tok(Inflight::MappingWriteBack { input: ih });
+            fx.push(Effect::CommitMapping {
+                tok,
+                store: target,
+                input: ih,
+                output: oh,
+            });
+        }
     }
 
     fn resolve_mapping(
@@ -427,65 +536,106 @@ impl Resolver {
         fx: &mut Vec<Effect>,
     ) {
         let Inflight::PresenceQuery { store, output: oh } = self.take_inflight(tok) else {
-            panic!("bug: PresenceAnswered for a non-presence-query token");
+            unreachable!()
         };
+        assert_eq!(
+            answer.output, oh,
+            "bug: presence answer echoes a different output"
+        );
         let is_local = matches!(self.dag.stores[&store], StoreDef::Local { .. });
-        let mut learned_refs: Option<BTreeSet<OutputHash>> = None;
+        let mut learned: Option<(BTreeSet<OutputHash>, RefsSource)> = None;
         {
             let r = self.realizations.get_mut(&oh).unwrap();
             r.pending_presence.remove(&store);
-            if answer.present {
-                if is_local {
-                    r.present_in.insert(store.clone());
-                    if matches!(r.state, RealizationState::Absent) {
-                        r.state = RealizationState::Present {
-                            store: store.clone(),
-                        };
+            match answer.presence {
+                Presence::Missing => {}
+                Presence::Present { runtime_refs } => {
+                    if is_local {
+                        r.present_in.insert(store.clone());
+                        if matches!(r.state, RealizationState::Absent) {
+                            r.state = RealizationState::Present {
+                                store: store.clone(),
+                            };
+                        }
+                        learned = Some((runtime_refs, RefsSource::LocalStore(store)));
+                    } else {
+                        r.available_in.insert(store.clone());
+                        // the claim lets us expand and pre-fetch the runtime
+                        // closure before the download itself lands
+                        learned = Some((runtime_refs, RefsSource::Claim(store)));
                     }
-                    if r.rt_refs.is_none() {
-                        learned_refs = Some(answer.runtime_refs.unwrap_or_else(|| {
-                            panic!(
-                                "bug: local store {store} reported presence without runtime refs"
-                            )
-                        }));
-                    }
-                } else {
-                    r.available_in.insert(store);
                 }
             }
         }
-        if let Some(refs) = learned_refs {
-            self.learn_runtime_refs(oh, refs, fx);
+        if let Some((refs, src)) = learned {
+            self.learn_runtime_refs(oh, refs, src, fx);
         }
         self.advance_realization(oh, fx);
     }
 
     /// The declared runtime refs of an output became known. This is where
     /// A7's "scope of targets expands": refs are bare output-hashes and may
-    /// belong to nodes we never named.
+    /// belong to nodes we never named. (Refs from an honest store always
+    /// point at outputs whose in-DAG producers, if any, are already named —
+    /// naming is top-down, so a named node's whole runtime closure is named
+    /// before it. That is why a producerless, unavailable ref is a definite
+    /// dead end and not a race.)
     fn learn_runtime_refs(
         &mut self,
         oh: OutputHash,
         refs: BTreeSet<OutputHash>,
+        source: RefsSource,
         fx: &mut Vec<Effect>,
     ) {
-        {
-            let r = self.realizations.get_mut(&oh).unwrap();
-            if r.rt_refs.is_some() {
-                return; // a fact, inserted once
+        if let Some(prev) = self.realizations[&oh].rt_refs.clone() {
+            if prev != refs {
+                // a CAS object has exactly one ref set (the hash covers the
+                // runtime-inputs tree); a disagreeing source lies or is corrupt
+                if !matches!(self.realizations[&oh].state, RealizationState::Failed(_)) {
+                    let fid = self.record_failure(
+                        FailureKind::NonDeterminism,
+                        Origin::Output(oh),
+                        FailureDetail::Text(format!(
+                            "runtime refs from {source} contradict the earlier fact"
+                        )),
+                    );
+                    self.fail_realization(oh, fid, fx);
+                }
+                return;
             }
-            r.rt_refs = Some(refs.clone());
-        }
-        for dep in refs {
-            if self.fully_realized(dep) {
-                continue;
+        } else {
+            // §8: substituted refs must stay inside the producer's build
+            // closure. Conclusive only when the input closures are fully
+            // known (always true for the build path, which checks pre-commit).
+            if !matches!(source, RefsSource::Built)
+                && let Some(pih) = self.realizations[&oh].producer
+                && let Some(allowed) = self.known_build_closure(self.mappings[&pih].nodes[0])
+                && let Some(escapee) = refs.iter().find(|d| !allowed.contains(d))
+            {
+                let builder = self.mappings[&pih].nodes[0];
+                let fid = self.record_failure(
+                    FailureKind::ClosureEscape,
+                    Origin::Node(builder),
+                    FailureDetail::Text(format!(
+                        "substituted runtime ref {escapee} escapes the build closure ({source})"
+                    )),
+                );
+                self.fail_mapping(pih, fid, fx);
+                self.fail_realization(oh, fid, fx);
+                return;
             }
-            self.realizations
-                .get_mut(&oh)
-                .unwrap()
-                .rt_missing
-                .insert(dep);
-            self.demand_output(dep, Reason::RuntimeOf(oh), fx);
+            self.realizations.get_mut(&oh).unwrap().rt_refs = Some(refs.clone());
+            for dep in refs {
+                if self.fully_realized(dep) {
+                    continue;
+                }
+                self.realizations
+                    .get_mut(&oh)
+                    .unwrap()
+                    .rt_missing
+                    .insert(dep);
+                self.demand_output(dep, Reason::RuntimeOf(oh), fx);
+            }
         }
         if self.fully_realized(oh) {
             self.on_realized(oh, fx);
@@ -657,12 +807,8 @@ impl Resolver {
         match self.take_inflight(tok) {
             Inflight::BuildLease { input: ih } => {
                 let builder = match &self.mappings[&ih].state {
-                    MappingState::Building {
-                        builder,
-                        phase: BuildPhase::AwaitingLease,
-                        ..
-                    } => *builder,
-                    s => panic!("bug: build lease granted in state {s:?}"),
+                    MappingState::Building { builder, .. } => *builder,
+                    _ => unreachable!(),
                 };
                 let (bt, recipe, store, inputs) = {
                     let dn = &self.dag.nodes[builder.idx()];
@@ -699,14 +845,10 @@ impl Resolver {
             }
             Inflight::DownloadLease { output: oh } => {
                 let (from, to) = {
-                    let RealizationState::Downloading {
-                        from,
-                        to,
-                        phase: DownloadPhase::AwaitingLease,
-                        ..
-                    } = &self.realizations[&oh].state
+                    let RealizationState::Downloading { from, to, .. } =
+                        &self.realizations[&oh].state
                     else {
-                        panic!("bug: download lease granted in wrong state")
+                        unreachable!()
                     };
                     (from.clone(), to.clone())
                 };
@@ -726,22 +868,21 @@ impl Resolver {
                     to,
                 });
             }
-            other => panic!("bug: LeaseGranted for {other:?}"),
+            _ => unreachable!(),
         }
     }
 
     fn on_build_finished(&mut self, tok: RequestId, outcome: BuildOutcome, fx: &mut Vec<Effect>) {
         let Inflight::Build { input: ih } = self.take_inflight(tok) else {
-            panic!("bug: BuildFinished for a non-build token");
+            unreachable!()
         };
         let (builder, known) = match &self.mappings[&ih].state {
             MappingState::Building {
                 builder,
                 known_output,
-                phase: BuildPhase::Running,
                 ..
             } => (*builder, *known_output),
-            s => panic!("bug: BuildFinished in state {s:?}"),
+            _ => unreachable!(),
         };
         match outcome {
             BuildOutcome::Failure { log } => {
@@ -757,23 +898,21 @@ impl Resolver {
                 runtime_refs,
                 log: _,
             } => {
-                let (bt, store, input_outputs) = {
+                let (bt, store) = {
                     let dn = &self.dag.nodes[builder.idx()];
-                    let ios: BTreeSet<OutputHash> = dn
-                        .upstreams
-                        .iter()
-                        .map(|(_, up)| self.node_output(*up).unwrap())
-                        .collect();
-                    (dn.builder, dn.target_store.clone(), ios)
+                    (dn.builder, dn.target_store.clone())
                 };
-                // B2/§8 for built nodes: a build can only declare runtime
-                // refs to inputs it actually saw
-                if !runtime_refs.is_subset(&input_outputs) {
+                // B2/§8 for built nodes, pre-commit: a build can only declare
+                // runtime refs to things it saw — its build closure
+                let allowed = self
+                    .known_build_closure(builder)
+                    .expect("bug: build finished with inputs whose closures are unknown");
+                if !runtime_refs.is_subset(&allowed) {
                     let fid = self.record_failure(
                         FailureKind::ClosureEscape,
                         Origin::Node(builder),
                         FailureDetail::Text(
-                            "build declared runtime refs outside its inputs".into(),
+                            "build declared runtime refs outside its build closure".into(),
                         ),
                     );
                     self.fail_mapping(ih, fid, fx);
@@ -818,12 +957,8 @@ impl Resolver {
             // bytes either way, proceed identically (B5)
             Inflight::BuildOutputCommit { input: ih } => {
                 let builder = match &self.mappings[&ih].state {
-                    MappingState::Building {
-                        builder,
-                        phase: BuildPhase::CommittingOutput { .. },
-                        ..
-                    } => *builder,
-                    s => panic!("bug: OutputCommitted in state {s:?}"),
+                    MappingState::Building { builder, .. } => *builder,
+                    _ => unreachable!(),
                 };
                 let store = self.dag.nodes[builder.idx()].target_store.clone();
                 let tok = self.tok(Inflight::BuildMappingCommit { input: ih });
@@ -851,91 +986,108 @@ impl Resolver {
                 });
             }
             Inflight::DownloadCommit { output: oh } => self.finish_download(oh, fx),
-            other => panic!("bug: OutputCommitted for {other:?}"),
+            _ => unreachable!(),
         }
     }
 
     fn on_mapping_committed(&mut self, tok: RequestId, result: CommitResult, fx: &mut Vec<Effect>) {
-        let Inflight::BuildMappingCommit { input: ih } = self.take_inflight(tok) else {
-            panic!("bug: MappingCommitted for a non-commit token");
-        };
-        match result {
-            CommitResult::Conflict { existing } => {
-                // feedback blocker 3: EEXIST with a different target — two
-                // builds of one input-hash produced different bytes
-                let builder = match &self.mappings[&ih].state {
-                    MappingState::Building { builder, .. } => *builder,
-                    s => panic!("bug: MappingCommitted in state {s:?}"),
-                };
-                let built = match &self.mappings[&ih].state {
-                    MappingState::Building {
-                        phase: BuildPhase::CommittingMapping { output, .. },
-                        ..
-                    } => *output,
-                    _ => unreachable!(),
-                };
-                let fid = self.record_failure(
-                    FailureKind::NonDeterminism,
-                    Origin::Node(builder),
-                    FailureDetail::Text(format!(
-                        "store maps input to {existing}, we built {built}"
-                    )),
-                );
-                self.fail_mapping(ih, fid, fx);
-            }
-            CommitResult::Committed => {
-                let m = self.mappings.get_mut(&ih).unwrap();
-                let prev = mem::replace(&mut m.state, MappingState::Unresolved);
-                let MappingState::Building {
-                    builder,
-                    known_output,
-                    lease,
-                    phase:
-                        BuildPhase::CommittingMapping {
-                            output,
-                            runtime_refs,
-                        },
-                } = prev
-                else {
-                    panic!("bug: MappingCommitted in state {prev:?}")
-                };
-                m.state = MappingState::Resolved { output };
-                let store = self.dag.nodes[builder.idx()].target_store.clone();
-                if let Some(l) = lease {
-                    fx.push(Effect::ReleaseLease {
-                        store: store.clone(),
-                        lease: l,
-                    });
-                }
-                // bytes are present *before* the naming cascade runs, so
-                // transferred demand immediately sees a Present realization
-                {
-                    let r = self.realizations.entry(output).or_default();
-                    r.present_in.insert(store.clone());
-                    if r.producer.is_none() {
-                        r.producer = Some(ih);
-                    }
-                    if !matches!(r.state, RealizationState::Present { .. }) {
-                        r.state = RealizationState::Present { store };
-                    }
-                }
-                self.learn_runtime_refs(output, runtime_refs, fx);
-                if known_output.is_none() {
-                    // first resolution: record the fact, cascade names
-                    let prev = self
-                        .knowledge
-                        .facts
-                        .insert(ih, (output, MappingSource::Built(builder)));
-                    assert!(
-                        prev.is_none(),
-                        "bug: built a mapping that already had a fact"
+        match self.take_inflight(tok) {
+            Inflight::BuildMappingCommit { input: ih } => match result {
+                CommitResult::Conflict { existing } => {
+                    // feedback blocker 3: EEXIST with a different target — two
+                    // builds of one input-hash produced different bytes
+                    let (builder, built) = match &self.mappings[&ih].state {
+                        MappingState::Building {
+                            builder,
+                            phase: BuildPhase::CommittingMapping { output, .. },
+                            ..
+                        } => (*builder, *output),
+                        _ => unreachable!(),
+                    };
+                    let fid = self.record_failure(
+                        FailureKind::NonDeterminism,
+                        Origin::Node(builder),
+                        FailureDetail::Text(format!(
+                            "store maps input to {existing}, we built {built}"
+                        )),
                     );
-                    let nodes = self.mappings[&ih].nodes.clone();
-                    for n in nodes {
-                        self.on_node_named(n, output, fx);
+                    self.fail_mapping(ih, fid, fx);
+                }
+                CommitResult::Committed => {
+                    let m = self.mappings.get_mut(&ih).unwrap();
+                    let prev = mem::replace(&mut m.state, MappingState::Unresolved);
+                    let MappingState::Building {
+                        builder,
+                        known_output,
+                        lease,
+                        phase:
+                            BuildPhase::CommittingMapping {
+                                output,
+                                runtime_refs,
+                            },
+                    } = prev
+                    else {
+                        unreachable!()
+                    };
+                    m.state = MappingState::Resolved { output };
+                    let store = self.dag.nodes[builder.idx()].target_store.clone();
+                    if let Some(l) = lease {
+                        fx.push(Effect::ReleaseLease {
+                            store: store.clone(),
+                            lease: l,
+                        });
+                    }
+                    // bytes are present *before* the naming cascade runs, so
+                    // transferred demand immediately sees a Present realization
+                    {
+                        let r = self.realizations.entry(output).or_default();
+                        r.present_in.insert(store.clone());
+                        if r.producer.is_none() {
+                            r.producer = Some(ih);
+                        }
+                        if !matches!(r.state, RealizationState::Present { .. }) {
+                            r.state = RealizationState::Present { store };
+                        }
+                    }
+                    self.learn_runtime_refs(output, runtime_refs, RefsSource::Built, fx);
+                    if known_output.is_none() {
+                        // first resolution: record the fact, cascade names
+                        let prev = self
+                            .knowledge
+                            .facts
+                            .insert(ih, (output, MappingSource::Built(builder)));
+                        assert!(
+                            prev.is_none(),
+                            "bug: built a mapping that already had a fact"
+                        );
+                        let nodes = self.mappings[&ih].nodes.clone();
+                        for n in nodes {
+                            self.on_node_named(n, output, fx);
+                        }
                     }
                 }
-            }
+            },
+            Inflight::MappingWriteBack { input: ih } => match result {
+                CommitResult::Committed => {} // the A12 record is on disk
+                CommitResult::Conflict { existing } => {
+                    // the local store answered our query without this mapping,
+                    // then turned out to hold a different one: concurrent
+                    // writer or corruption — the nondeterminism detector fires
+                    if !matches!(self.mappings[&ih].state, MappingState::Failed(_)) {
+                        let blame = self.mappings[&ih].nodes[0];
+                        let learned = self.knowledge.facts.get(&ih).unwrap().0;
+                        let fid = self.record_failure(
+                            FailureKind::NonDeterminism,
+                            Origin::Node(blame),
+                            FailureDetail::Text(format!(
+                                "write-back found {existing} on disk, we learned {learned}"
+                            )),
+                        );
+                        self.fail_mapping(ih, fid, fx);
+                    }
+                }
+            },
+            _ => unreachable!(),
         }
     }
 
@@ -949,7 +1101,7 @@ impl Resolver {
         fx: &mut Vec<Effect>,
     ) {
         let Inflight::Download { output: oh } = self.take_inflight(tok) else {
-            panic!("bug: DownloadFinished for a non-download token");
+            unreachable!()
         };
         match outcome {
             DownloadOutcome::Failure { error } => {
@@ -964,13 +1116,9 @@ impl Resolver {
             }
             DownloadOutcome::Success { runtime_refs } => {
                 let to = {
-                    let RealizationState::Downloading {
-                        to,
-                        phase: DownloadPhase::Fetching,
-                        ..
-                    } = &self.realizations[&oh].state
+                    let RealizationState::Downloading { to, .. } = &self.realizations[&oh].state
                     else {
-                        panic!("bug: DownloadFinished in wrong state")
+                        unreachable!()
                     };
                     to.clone()
                 };
@@ -994,13 +1142,13 @@ impl Resolver {
         let r = self.realizations.get_mut(&oh).unwrap();
         let prev = mem::replace(&mut r.state, RealizationState::Absent);
         let RealizationState::Downloading {
+            from,
             to,
             lease,
             phase: DownloadPhase::Committing { runtime_refs },
-            ..
         } = prev
         else {
-            panic!("bug: finish_download in state {prev:?}")
+            unreachable!()
         };
         r.present_in.insert(to.clone());
         r.state = RealizationState::Present { store: to.clone() };
@@ -1010,9 +1158,63 @@ impl Resolver {
                 lease: l,
             });
         }
-        // TODO(A12): also write the learned mapping back into the local
-        // store (CommitMapping) once the download path grows its second leg
-        self.learn_runtime_refs(oh, runtime_refs, fx);
+        // verifies the pre-download claim if one was recorded, and fires the
+        // completion cascade either way
+        self.learn_runtime_refs(oh, runtime_refs, RefsSource::Download(from), fx);
+    }
+
+    // ------------------------------------------------------------------
+    // cancellation (fail-fast drain, host policy)
+
+    fn on_cancelled(&mut self, tok: RequestId, fx: &mut Vec<Effect>) {
+        self.saw_cancel = true;
+        match self.take_inflight(tok) {
+            // the wave simply never completes; the entry parks where it is
+            // and is reported Incomplete at quiescence
+            Inflight::MappingQuery { .. } | Inflight::PresenceQuery { .. } => {}
+            Inflight::BuildLease { input: ih } => {
+                let MappingState::Building { phase, .. } =
+                    &mut self.mappings.get_mut(&ih).unwrap().state
+                else {
+                    unreachable!()
+                };
+                *phase = BuildPhase::AwaitingInputs;
+            }
+            Inflight::Build { input: ih } => {
+                let store = match &self.mappings[&ih].state {
+                    MappingState::Building { builder, .. } => {
+                        self.dag.nodes[builder.idx()].target_store.clone()
+                    }
+                    _ => unreachable!(),
+                };
+                let MappingState::Building { lease, phase, .. } =
+                    &mut self.mappings.get_mut(&ih).unwrap().state
+                else {
+                    unreachable!()
+                };
+                if let Some(l) = lease.take() {
+                    fx.push(Effect::ReleaseLease { store, lease: l });
+                }
+                *phase = BuildPhase::AwaitingInputs;
+            }
+            Inflight::DownloadLease { output: oh } => {
+                self.realizations.get_mut(&oh).unwrap().state = RealizationState::Absent;
+            }
+            Inflight::Download { output: oh } => {
+                let r = self.realizations.get_mut(&oh).unwrap();
+                let prev = mem::replace(&mut r.state, RealizationState::Absent);
+                if let RealizationState::Downloading {
+                    to, lease: Some(l), ..
+                } = prev
+                {
+                    fx.push(Effect::ReleaseLease {
+                        store: to,
+                        lease: l,
+                    });
+                }
+            }
+            other => unreachable!("classify() blocked cancelling {other:?}"),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1034,7 +1236,12 @@ impl Resolver {
         fid
     }
 
+    /// First failure wins; later causes for an already-failed entry are
+    /// recorded in the table but do not re-blame.
     fn fail_mapping(&mut self, ih: InputHash, fid: FailureId, fx: &mut Vec<Effect>) {
+        if matches!(self.mappings[&ih].state, MappingState::Failed(_)) {
+            return;
+        }
         let m = self.mappings.get_mut(&ih).unwrap();
         let prev = mem::replace(&mut m.state, MappingState::Failed(fid));
         let nodes = m.nodes.clone();
@@ -1056,6 +1263,9 @@ impl Resolver {
     }
 
     fn fail_realization(&mut self, oh: OutputHash, fid: FailureId, fx: &mut Vec<Effect>) {
+        if matches!(self.realizations[&oh].state, RealizationState::Failed(_)) {
+            return;
+        }
         let r = self.realizations.get_mut(&oh).unwrap();
         let prev = mem::replace(&mut r.state, RealizationState::Failed(fid));
         if let RealizationState::Downloading {
@@ -1099,20 +1309,30 @@ impl Resolver {
                 );
                 NodeStatus::Failed { failure: fid }
             } else {
-                let oh = self
-                    .node_output(id)
-                    .expect("bug: quiesced with an unnamed, unfailed node");
-                if self.nodes[i].demand.realize.is_empty() {
-                    NodeStatus::Named { output: oh }
-                } else if self.fully_realized(oh) {
-                    let store = self.realizations[&oh].present_in.first().unwrap().clone();
-                    NodeStatus::Realized { output: oh, store }
-                } else if let Some(fid) = self.realization_blame(oh, &mut BTreeSet::new()) {
-                    NodeStatus::Failed { failure: fid }
-                } else {
-                    panic!(
-                        "bug: node {id:?} demanded but neither realized nor failed at quiescence"
-                    );
+                match self.node_output(id) {
+                    None => {
+                        assert!(
+                            self.saw_cancel,
+                            "bug: quiesced with an unnamed, unfailed node and no cancellations"
+                        );
+                        NodeStatus::Incomplete
+                    }
+                    Some(oh) => {
+                        if self.nodes[i].demand.realize.is_empty() {
+                            NodeStatus::Named { output: oh }
+                        } else if self.fully_realized(oh) {
+                            let store = self.realizations[&oh].present_in.first().unwrap().clone();
+                            NodeStatus::Realized { output: oh, store }
+                        } else if let Some(fid) = self.realization_blame(oh, &mut BTreeSet::new()) {
+                            NodeStatus::Failed { failure: fid }
+                        } else {
+                            assert!(
+                                self.saw_cancel,
+                                "bug: node {id:?} demanded but neither realized nor failed at quiescence"
+                            );
+                            NodeStatus::Incomplete
+                        }
+                    }
                 }
             };
             statuses.push(status);
@@ -1186,6 +1406,26 @@ impl Resolver {
                 && r.rt_refs.is_some()
                 && r.rt_missing.is_empty()
         })
+    }
+
+    /// The full output set a build of `node` may reference at runtime: its
+    /// direct inputs' outputs plus their (recursively known) runtime
+    /// closures. `None` when some closure is not yet known — validation is
+    /// then inconclusive (possible for substituted outputs under early
+    /// cutoff, never for the build path).
+    fn known_build_closure(&self, node: NodeId) -> Option<BTreeSet<OutputHash>> {
+        let mut out = BTreeSet::new();
+        let mut stack: Vec<OutputHash> = Vec::new();
+        for up in self.dag.nodes[node.idx()].distinct_upstreams() {
+            stack.push(self.node_output(up)?);
+        }
+        while let Some(oh) = stack.pop() {
+            if out.insert(oh) {
+                let r = self.realizations.get(&oh)?;
+                stack.extend(r.rt_refs.as_ref()?.iter().copied());
+            }
+        }
+        Some(out)
     }
 
     fn store_rank(&self, s: &StoreName) -> usize {

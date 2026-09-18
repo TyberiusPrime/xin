@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::events::{
-    BuildOutcome, CommitResult, DownloadOutcome, Effect, Event, LeaseId, PresenceAnswer,
+    BuildOutcome, CommitResult, DownloadOutcome, Effect, Event, LeaseId, Presence, PresenceAnswer,
 };
 use crate::failure::BuildLog;
 use crate::hashes::{InputHash, OutputHash, hash_bytes};
@@ -19,6 +19,9 @@ pub struct SimStore {
     pub mappings: BTreeMap<InputHash, OutputHash>,
     /// output-hash → declared runtime refs
     pub outputs: BTreeMap<OutputHash, BTreeSet<OutputHash>>,
+    /// what the store *claims* as runtime refs in presence answers, when it
+    /// differs from the truth — lets tests script lying/corrupt stores
+    pub claim_overrides: BTreeMap<OutputHash, BTreeSet<OutputHash>>,
 }
 
 /// Scripted behavior for one node's builds (failure injection).
@@ -104,19 +107,21 @@ impl SimWorld {
                 Some(Event::MappingAnswered { tok, output })
             }
             Effect::QueryPresence { tok, store, output } => {
-                let (def, s) = &self.stores[&store];
-                let present = s.outputs.contains_key(&output);
-                let runtime_refs = if present && matches!(def, StoreDef::Local { .. }) {
-                    Some(s.outputs[&output].clone())
-                } else {
-                    None
+                let s = self.store(&store);
+                let presence = match s.outputs.get(&output) {
+                    None => Presence::Missing,
+                    Some(refs) => {
+                        let runtime_refs = s
+                            .claim_overrides
+                            .get(&output)
+                            .cloned()
+                            .unwrap_or_else(|| refs.clone());
+                        Presence::Present { runtime_refs }
+                    }
                 };
                 Some(Event::PresenceAnswered {
                     tok,
-                    answer: PresenceAnswer {
-                        present,
-                        runtime_refs,
-                    },
+                    answer: PresenceAnswer { output, presence },
                 })
             }
             Effect::AcquireLease {
@@ -255,12 +260,34 @@ fn xorshift(s: &mut u64) -> u64 {
 /// different interleavings; the confluence property says the end conditions
 /// must not care.
 pub fn drive(resolver: &mut Resolver, world: &mut SimWorld, seed: u64) -> Outcome {
+    drive_policy(resolver, world, seed, Policy::KeepGoing)
+}
+
+/// §7: keep-going vs fail-fast is a *scheduler* policy, not a core code
+/// path. FailFast stops dispatching new work once the core has recorded a
+/// failure and drains the rest: cancellable effects are answered with
+/// `Event::Cancelled`, commits and releases always run to completion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Policy {
+    KeepGoing,
+    FailFast,
+}
+
+pub fn drive_policy(
+    resolver: &mut Resolver,
+    world: &mut SimWorld,
+    seed: u64,
+    policy: Policy,
+) -> Outcome {
     let mut rng = seed.wrapping_mul(2685821657736338717).wrapping_add(1);
     let mut pending: Vec<Effect> = resolver.start();
     while !pending.is_empty() {
         let i = (xorshift(&mut rng) % pending.len() as u64) as usize;
         let eff = pending.swap_remove(i);
-        if let Some(ev) = world.execute(eff) {
+        if policy == Policy::FailFast && !resolver.failures.is_empty() && eff.cancellable() {
+            let tok = eff.tok().unwrap();
+            pending.extend(resolver.apply(Event::Cancelled { tok }));
+        } else if let Some(ev) = world.execute(eff) {
             pending.extend(resolver.apply(ev));
         }
     }

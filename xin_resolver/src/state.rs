@@ -133,8 +133,9 @@ pub struct Realization {
     /// facts: which local stores have the bytes / which remotes could serve them
     pub present_in: BTreeSet<StoreName>,
     pub available_in: BTreeSet<StoreName>,
-    /// declared runtime refs, once learned (from build, download, or a local
-    /// store's presence answer); a fact, inserted once
+    /// declared runtime refs, once learned (from build, download, a local
+    /// store's presence answer, or a remote's availability claim); a fact,
+    /// inserted once — a later disagreeing source is a failure
     pub rt_refs: Option<BTreeSet<OutputHash>>,
     /// runtime deps not yet fully realized; drains monotonically
     pub rt_missing: BTreeSet<OutputHash>,
@@ -145,10 +146,11 @@ pub struct Realization {
     pub queried: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MappingSource {
     Built(NodeId),
-    Substituted,
+    /// resolved from a store answer wave; names the (rank-lowest) store
+    Substituted(StoreName),
 }
 
 /// Positive + negative knowledge about stores (§5). Consulted *before* an
@@ -161,4 +163,88 @@ pub struct StoreKnowledge {
     pub facts: BTreeMap<InputHash, (OutputHash, MappingSource)>,
     pub asked_mappings: BTreeSet<(StoreName, InputHash)>,
     pub asked_presence: BTreeSet<(StoreName, OutputHash)>,
+}
+
+/// Flat state kinds for the transition table (M3). Build/download phases
+/// are distinct kinds: each outstanding request pins its entry to exactly
+/// one phase, and the table says which.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MappingStateKind {
+    Unresolved,
+    Querying,
+    BuildingAwaitingInputs,
+    BuildingAwaitingLease,
+    BuildingRunning,
+    BuildingCommittingOutput,
+    BuildingCommittingMapping,
+    Resolved,
+    Failed,
+}
+
+impl MappingStateKind {
+    pub const ALL: &[MappingStateKind] = &[
+        MappingStateKind::Unresolved,
+        MappingStateKind::Querying,
+        MappingStateKind::BuildingAwaitingInputs,
+        MappingStateKind::BuildingAwaitingLease,
+        MappingStateKind::BuildingRunning,
+        MappingStateKind::BuildingCommittingOutput,
+        MappingStateKind::BuildingCommittingMapping,
+        MappingStateKind::Resolved,
+        MappingStateKind::Failed,
+    ];
+}
+
+impl MappingState {
+    pub fn kind(&self) -> MappingStateKind {
+        match self {
+            MappingState::Unresolved => MappingStateKind::Unresolved,
+            MappingState::Querying { .. } => MappingStateKind::Querying,
+            MappingState::Building { phase, .. } => match phase {
+                BuildPhase::AwaitingInputs => MappingStateKind::BuildingAwaitingInputs,
+                BuildPhase::AwaitingLease => MappingStateKind::BuildingAwaitingLease,
+                BuildPhase::Running => MappingStateKind::BuildingRunning,
+                BuildPhase::CommittingOutput { .. } => MappingStateKind::BuildingCommittingOutput,
+                BuildPhase::CommittingMapping { .. } => MappingStateKind::BuildingCommittingMapping,
+            },
+            MappingState::Resolved { .. } => MappingStateKind::Resolved,
+            MappingState::Failed(_) => MappingStateKind::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RealizationStateKind {
+    Absent,
+    DownloadingAwaitingLease,
+    DownloadingFetching,
+    DownloadingCommitting,
+    Present,
+    Failed,
+}
+
+impl RealizationStateKind {
+    pub const ALL: &[RealizationStateKind] = &[
+        RealizationStateKind::Absent,
+        RealizationStateKind::DownloadingAwaitingLease,
+        RealizationStateKind::DownloadingFetching,
+        RealizationStateKind::DownloadingCommitting,
+        RealizationStateKind::Present,
+        RealizationStateKind::Failed,
+    ];
+}
+
+impl RealizationState {
+    pub fn kind(&self) -> RealizationStateKind {
+        match self {
+            RealizationState::Absent => RealizationStateKind::Absent,
+            RealizationState::Downloading { phase, .. } => match phase {
+                DownloadPhase::AwaitingLease => RealizationStateKind::DownloadingAwaitingLease,
+                DownloadPhase::Fetching => RealizationStateKind::DownloadingFetching,
+                DownloadPhase::Committing { .. } => RealizationStateKind::DownloadingCommitting,
+            },
+            RealizationState::Present { .. } => RealizationStateKind::Present,
+            RealizationState::Failed(_) => RealizationStateKind::Failed,
+        }
+    }
 }
