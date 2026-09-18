@@ -129,7 +129,7 @@ input-output mapping.
 
 We need also a way to decide policy on 'remote stores disagree
 on input->output mapping' - for the first version that's a build failure for that node,
-and requires blacklisting it's input hash for one (or all) remote stores to get around.
+and requires deny-listing it's input hash for one (or all) remote stores to get around.
 
 ##  A6
 
