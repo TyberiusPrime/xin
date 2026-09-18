@@ -4,7 +4,8 @@
 //! root/outputs/<sh>/<output-hash>/{payload/, runtime-inputs/}   (A1 node layout)
 //! root/inputs/<sh>/<input-hash>  -> ../../outputs/<sh>/<output-hash>
 //! root/temp/<build dirs>                                        (same fs => atomic rename)
-//! root/gc-protect/<lease>/<n>    -> dangling-ok symlinks        (A6)
+//! root/gc-protect/<pid>-<lease>/<n> -> dangling-ok symlinks      (A6)
+//! root/gc-roots/<h>              -> /abs/path/of/results-symlink  (indirect roots)
 //! root/meta/by_input/<sh>/<input-hash>/{stdout,stderr,exit}
 //! ```
 //!
@@ -38,7 +39,14 @@ impl LocalStore {
     /// Open (creating layout directories as needed — idempotent).
     pub fn open(root: impl Into<PathBuf>) -> io::Result<LocalStore> {
         let root = root.into();
-        for d in ["outputs", "inputs", "temp", "gc-protect", "meta"] {
+        for d in [
+            "outputs",
+            "inputs",
+            "temp",
+            "gc-protect",
+            "gc-roots",
+            "meta",
+        ] {
             fs::create_dir_all(root.join(d))?;
         }
         Ok(LocalStore {
@@ -84,13 +92,18 @@ impl LocalStore {
     }
 
     /// A6: protection must hold regardless of current existence, so the
-    /// gc-protect entries may dangle.
+    /// gc-protect entries may dangle. The directory name carries our pid so
+    /// concurrent processes cannot collide and `gc` can recognize leases
+    /// whose holder died.
+    fn lease_dir(&self, lease: LeaseId) -> PathBuf {
+        self.root
+            .join("gc-protect")
+            .join(format!("{}-{}", process::id(), lease.0))
+    }
+
     pub fn acquire_lease(&mut self, protect: &BTreeSet<OutputHash>) -> io::Result<LeaseId> {
         self.next_lease += 1;
-        let dir = self
-            .root
-            .join("gc-protect")
-            .join(self.next_lease.to_string());
+        let dir = self.lease_dir(LeaseId(self.next_lease));
         fs::create_dir_all(&dir)?;
         for (i, oh) in protect.iter().enumerate() {
             let name = oh.to_string();
@@ -101,7 +114,7 @@ impl LocalStore {
     }
 
     pub fn release_lease(&self, lease: LeaseId) -> io::Result<()> {
-        fs::remove_dir_all(self.root.join("gc-protect").join(lease.0.to_string()))
+        fs::remove_dir_all(self.lease_dir(lease))
     }
 
     pub fn held_leases(&self) -> io::Result<usize> {
@@ -169,6 +182,50 @@ impl LocalStore {
         fs::write(dir.join("stderr"), &log.stderr)?;
         fs::write(dir.join("exit"), format!("{}\n", log.return_code))?;
         Ok(())
+    }
+
+    pub fn read_build_meta(&self, ih: InputHash) -> io::Result<Option<BuildLog>> {
+        let dir = sharded(self.root.join("meta").join("by_input"), &ih.to_string());
+        if !dir.is_dir() {
+            return Ok(None);
+        }
+        let return_code = fs::read_to_string(dir.join("exit"))?
+            .trim()
+            .parse::<i32>()
+            .map_err(io::Error::other)?;
+        Ok(Some(BuildLog {
+            stdout: fs::read(dir.join("stdout"))?,
+            stderr: fs::read(dir.join("stderr"))?,
+            return_code,
+        }))
+    }
+
+    /// Register an indirect gc root (nix-style): gc-roots/<h> points at a
+    /// user-facing symlink (typically results/<name>), which in turn points
+    /// at an output. Deleting the results link releases the root — `gc`
+    /// drops entries whose target is gone.
+    pub fn register_root(&self, link: &Path) -> io::Result<()> {
+        let name = blake3::hash(link.as_os_str().as_encoded_bytes())
+            .to_hex()
+            .to_string();
+        let entry = self.root.join("gc-roots").join(&name[..32]);
+        match fs::remove_file(&entry) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        std::os::unix::fs::symlink(link, entry)
+    }
+
+    /// All registered indirect roots: (entry path, target path).
+    pub fn roots(&self) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.root.join("gc-roots"))? {
+            let path = entry?.path();
+            out.push((path.clone(), fs::read_link(&path)?));
+        }
+        out.sort();
+        Ok(out)
     }
 }
 

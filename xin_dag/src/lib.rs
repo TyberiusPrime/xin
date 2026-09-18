@@ -15,9 +15,11 @@
 use std::io;
 use std::path::Path;
 
+pub mod config;
 pub mod nickel;
 pub mod schema;
 
+pub use config::{OnFailure, XinConfig};
 pub use schema::{DagBundle, StoreLocation, TomlDag};
 
 #[derive(Debug)]
@@ -53,15 +55,24 @@ pub fn parse_toml(text: &str) -> Result<DagBundle, DagError> {
     dag.into_bundle()
 }
 
-/// Load a DAG definition by extension: `.ncl` is evaluated through Nickel,
-/// `.toml` is parsed directly. Returns the bundle plus the TOML
-/// intermediary text (for `--emit-toml`-style inspection).
-pub fn load(path: &Path) -> Result<(DagBundle, String), DagError> {
+/// Load a DAG definition to the TOML-intermediary stage by extension:
+/// `.ncl` is evaluated through Nickel, `.toml` is parsed directly. The
+/// parsed `TomlDag` still has config merging (`merge_config`) and bundling
+/// (`into_bundle`) ahead of it; the returned text is the intermediary for
+/// `xin eval`-style inspection.
+pub fn load_dag(path: &Path) -> Result<(TomlDag, String), DagError> {
     let text = match path.extension().and_then(|e| e.to_str()) {
         Some("ncl") => nickel::eval_to_toml(path, &[])?,
         Some("toml") => std::fs::read_to_string(path).map_err(DagError::Io)?,
         _ => return Err(DagError::UnknownExtension(path.display().to_string())),
     };
-    let bundle = parse_toml(&text)?;
-    Ok((bundle, text))
+    let dag: TomlDag = toml::from_str(&text).map_err(|e| DagError::Toml(Box::new(e)))?;
+    Ok((dag, text))
+}
+
+/// Load a self-contained DAG definition (stores defined inline) into a
+/// bundle. The CLI path goes through `load_dag` + `merge_config` instead.
+pub fn load(path: &Path) -> Result<(DagBundle, String), DagError> {
+    let (dag, text) = load_dag(path)?;
+    Ok((dag.into_bundle()?, text))
 }

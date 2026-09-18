@@ -1,18 +1,20 @@
 //! The real-IO host: executes the resolver's effects against filesystem
-//! stores and subprocess builds, synchronously and in emission order. The
-//! DAG definition layer does not exist yet, so callers hand over a
-//! `RawInput` directly. Parallel builds / core scheduling (B11) are a later
-//! milestone — this driver is about making the effect vocabulary real.
+//! stores and subprocess builds, synchronously and in emission order.
+//! Parallel builds / core scheduling (B11) are a later milestone — this
+//! driver is about making the effect vocabulary real.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 
-use xin_resolver::events::{DownloadOutcome, Effect, Event, Presence, PresenceAnswer};
+use xin_resolver::events::{
+    BuildOutcome, DownloadOutcome, Effect, Event, Presence, PresenceAnswer,
+};
 use xin_resolver::hashes::OutputHash;
 use xin_resolver::input::{BuilderType, RawInput, StoreName};
 use xin_resolver::resolver::Outcome;
+use xin_resolver::sim::Policy;
 use xin_resolver::{Resolver, failure::BuildLog};
 
 use crate::builder::{BuildRun, run_process_build};
@@ -31,11 +33,19 @@ struct Staged {
     build_dir: Option<PathBuf>,
 }
 
+/// The exit code the driver reports for builds it *refused to run* in
+/// query-only mode; lets `xin status` tell "needs build" from real
+/// failures. Out of the 0..=255 range a process can produce.
+pub const QUERY_ONLY_EXIT: i32 = -75;
+
 pub struct Driver {
     /// definition order = the resolver's store ranking order
     stores: Vec<(StoreName, Backend)>,
     staged: BTreeMap<OutputHash, Staged>,
     pub builds_run: u32,
+    /// answer store queries truthfully but refuse builds and downloads
+    /// (with `QUERY_ONLY_EXIT`); the basis of `xin status`
+    pub query_only: bool,
 }
 
 impl Driver {
@@ -44,6 +54,7 @@ impl Driver {
             stores,
             staged: BTreeMap::new(),
             builds_run: 0,
+            query_only: false,
         }
     }
 
@@ -123,6 +134,18 @@ impl Driver {
                 inputs,
                 ..
             } => {
+                if self.query_only {
+                    return Ok(Some(Event::BuildFinished {
+                        tok,
+                        outcome: BuildOutcome::Failure {
+                            log: BuildLog {
+                                stdout: Vec::new(),
+                                stderr: b"xin: build not attempted (status query)".to_vec(),
+                                return_code: QUERY_ONLY_EXIT,
+                            },
+                        },
+                    }));
+                }
                 self.builds_run += 1;
                 let outcome = match builder {
                     BuilderType::Process => {
@@ -170,13 +193,17 @@ impl Driver {
                 Ok(Some(Event::BuildFinished { tok, outcome }))
             }
             Effect::StartDownload { tok, from, .. } => {
-                // unreachable with the dummy remote (it never claims
-                // availability); answer defensively instead of panicking
+                // query-only refuses; otherwise unreachable with the dummy
+                // remote (it never claims availability) — answer
+                // defensively instead of panicking
+                let error = if self.query_only {
+                    "xin: download not attempted (status query)".to_owned()
+                } else {
+                    format!("store {from} cannot serve downloads")
+                };
                 Ok(Some(Event::DownloadFinished {
                     tok,
-                    outcome: DownloadOutcome::Failure {
-                        error: format!("store {from} cannot serve downloads"),
-                    },
+                    outcome: DownloadOutcome::Failure { error },
                 }))
             }
             Effect::CommitOutput { tok, store, output } => {
@@ -206,16 +233,29 @@ impl Driver {
     }
 }
 
-/// Drive a resolver over real IO to quiescence (keep-going; fail-fast as a
-/// host policy can reuse the same cancellation contract as `sim` later).
-pub fn run_to_quiescence(resolver: &mut Resolver, driver: &mut Driver) -> io::Result<Outcome> {
+/// Drive a resolver over real IO to quiescence. Fail-fast is the same host
+/// policy as in `sim::step`: once the core has recorded a failure, pending
+/// cancellable effects are answered with `Event::Cancelled` instead of
+/// executed; commits and lease releases always run to completion (§7).
+pub fn run_with_policy(
+    resolver: &mut Resolver,
+    driver: &mut Driver,
+    policy: Policy,
+) -> io::Result<Outcome> {
     let mut pending: VecDeque<Effect> = resolver.start().into();
     while let Some(eff) = pending.pop_front() {
-        if let Some(ev) = driver.execute(eff)? {
+        if policy == Policy::FailFast && !resolver.failures.is_empty() && eff.cancellable() {
+            let tok = eff.tok().unwrap();
+            pending.extend(resolver.apply(Event::Cancelled { tok }));
+        } else if let Some(ev) = driver.execute(eff)? {
             pending.extend(resolver.apply(ev));
         }
     }
     Ok(resolver.quiesced())
+}
+
+pub fn run_to_quiescence(resolver: &mut Resolver, driver: &mut Driver) -> io::Result<Outcome> {
+    run_with_policy(resolver, driver, Policy::KeepGoing)
 }
 
 /// Convenience: ingest, resolve, and run in one call.

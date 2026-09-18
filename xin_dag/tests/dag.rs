@@ -253,3 +253,60 @@ let xin = import "xin.ncl" in
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+// -------------------------------------------------------------- config
+
+use xin_dag::config::{OnFailure, XinConfig};
+
+fn write_config(dir: &std::path::Path, text: &str) -> std::path::PathBuf {
+    let p = dir.join("xin.config.toml");
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
+#[test]
+fn config_loads_stores_policy_and_absolutizes_paths() {
+    let dir = std::env::temp_dir().join(format!("xin-cfg-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = write_config(
+        &dir,
+        "on_failure = \"fail-fast\"\nresults = \"out\"\n[stores.main]\ntype = \"local\"\npath = \"./store\"\n",
+    );
+    let cfg = XinConfig::load(&p).unwrap();
+    assert_eq!(cfg.on_failure, OnFailure::FailFast);
+    assert!(cfg.results.is_absolute() && cfg.results.ends_with("out"));
+    let xin_dag::schema::TomlStore::Local { path, .. } = &cfg.stores["main"] else {
+        panic!("expected a local store");
+    };
+    assert!(
+        std::path::Path::new(path).is_absolute(),
+        "store path {path} not absolutized"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_rejects_unknown_policy_words_and_fields() {
+    let dir = std::env::temp_dir().join(format!("xin-cfg-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = write_config(&dir, "on_failure = \"explode\"\n");
+    let err = XinConfig::load(&p).unwrap_err().to_string();
+    assert!(err.contains("keep-going"), "{err}");
+    let p = write_config(&dir, "no_such_setting = 1\n");
+    assert!(
+        XinConfig::load(&p).is_err(),
+        "unknown fields must be rejected"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_discovery_walks_upward() {
+    let dir = std::env::temp_dir().join(format!("xin-cfg-find-{}", std::process::id()));
+    let nested = dir.join("a/b/c");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert_eq!(XinConfig::find(&nested), None);
+    let p = write_config(&dir, "");
+    assert_eq!(XinConfig::find(&nested), Some(p));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

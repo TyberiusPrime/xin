@@ -58,7 +58,11 @@
       | String
       | doc "which local store is primary; optional when only one is writeable"
       | optional,
-    stores | { _ : Dyn },
+    stores
+      | { _ : Dyn }
+      | doc "usually empty: stores & policy live in xin.config.toml; inline definitions are for self-contained files"
+      | default
+      = {},
     nodes | { _ : Node },
   },
 

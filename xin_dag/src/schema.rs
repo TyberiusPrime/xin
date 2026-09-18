@@ -20,11 +20,14 @@ use crate::DagError;
 #[serde(deny_unknown_fields)]
 pub struct TomlDag {
     pub primary: Option<String>,
+    /// usually empty — stores live in xin.config.toml and get merged in via
+    /// `merge_config`; inline definitions keep single-file DAGs possible
+    #[serde(default)]
     pub stores: BTreeMap<String, TomlStore>,
     pub nodes: BTreeMap<String, TomlNode>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum TomlStore {
     Local {
@@ -91,7 +94,48 @@ pub struct DagBundle {
     pub locations: BTreeMap<StoreName, StoreLocation>,
 }
 
+/// Rebase relative local-store paths onto the directory their defining file
+/// lives in, so cwd never influences where a store ends up.
+pub fn absolutize_stores(stores: &mut BTreeMap<String, TomlStore>, base: &std::path::Path) {
+    for store in stores.values_mut() {
+        if let TomlStore::Local { path, .. } = store {
+            let p = std::path::Path::new(path.as_str());
+            if p.is_relative() {
+                // component-wise join normalizes away "./" without touching
+                // the filesystem (the store may not exist yet)
+                let mut joined = base.to_path_buf();
+                for c in p.components() {
+                    match c {
+                        std::path::Component::CurDir => {}
+                        c => joined.push(c),
+                    }
+                }
+                *path = joined.to_string_lossy().into_owned();
+            }
+        }
+    }
+}
+
 impl TomlDag {
+    /// Fold the config file's stores (and primary, if the DAG names none)
+    /// into this DAG. A store defined in both places is an error, not a
+    /// shadowing rule.
+    pub fn merge_config(&mut self, cfg: &crate::config::XinConfig) -> Result<(), DagError> {
+        for (name, store) in &cfg.stores {
+            if self.stores.contains_key(name) {
+                return Err(DagError::Value(format!(
+                    "store {name} is defined both in the DAG file and in {}",
+                    cfg.path.display()
+                )));
+            }
+            self.stores.insert(name.clone(), store.clone());
+        }
+        if self.primary.is_none() {
+            self.primary = cfg.primary.clone();
+        }
+        Ok(())
+    }
+
     pub fn into_bundle(self) -> Result<DagBundle, DagError> {
         let store_name = |s: &str| StoreName::new(s).map_err(|e| DagError::Value(format!("{e:?}")));
 
