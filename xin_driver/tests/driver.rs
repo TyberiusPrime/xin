@@ -316,3 +316,111 @@ fn malformed_runtime_ref_declaration_fails_the_build() {
     };
     assert_eq!(out.failures[failure.idx()].kind, FailureKind::Build);
 }
+
+// ----------------------------------------------------------- containers
+
+use xin_driver::{ContainerMode, ContainerPref};
+
+/// bwrap when the host has it (skip loudly otherwise, e.g. minimal CI).
+fn bwrap_mode() -> Option<ContainerMode> {
+    match ContainerMode::detect(ContainerPref::Auto).unwrap() {
+        ContainerMode::Direct => {
+            eprintln!("skipping container test: no bwrap in PATH");
+            None
+        }
+        mode => Some(mode),
+    }
+}
+
+#[test]
+fn container_build_is_isolated_and_sees_the_b4_layout() {
+    let Some(mode) = bwrap_mode() else { return };
+    let td = TestDir::new("container_isolated");
+    // the test dir itself is proof of host visibility: this recipe only
+    // succeeds if the host filesystem is NOT there and the B4 paths ARE
+    let recipe = format!(
+        r#"
+set -e
+test ! -e "{host}"
+test "$XIN_OUT" = /xin/out
+test "$PWD" = /xin/work
+echo hello > "$XIN_OUT/payload/greeting"
+"#,
+        host = td.path.display()
+    );
+    let top_recipe = r#"
+set -e
+test -e "/xin/$XIN_INPUT_HASH_base/payload/greeting"
+tr a-z A-Z < "$XIN_INPUTS/base/payload/greeting" > "$XIN_OUT/payload/shout"
+ln -s "../../$XIN_INPUT_HASH_base" "$XIN_OUT/runtime-inputs/base"
+"#;
+    let input = raw(vec![
+        ("base", node(&recipe, &[], false)),
+        ("top", node(top_recipe, &[("base", "base")], true)),
+    ]);
+    let mut driver = driver_for(&td);
+    driver.container = mode;
+    let (r, d, out) = resolve(input, driver).unwrap();
+    assert!(out.success, "failures: {:?}", out.failures);
+    assert_eq!(d.builds_run, 2);
+    let oh = realized_output(&out.statuses[r.dag.id_of("top").unwrap().idx()]);
+    let dir = d.local(&sn("primary")).output_dir(oh);
+    assert_eq!(
+        fs::read_to_string(dir.join("payload/shout")).unwrap(),
+        "HELLO\n"
+    );
+    // the declared ref carries the canonical relocatable form on disk
+    let target = fs::read_link(dir.join("runtime-inputs/base")).unwrap();
+    assert!(target.to_str().unwrap().starts_with("../../"));
+}
+
+#[test]
+fn container_build_has_no_network() {
+    let Some(mode) = bwrap_mode() else { return };
+    let td = TestDir::new("container_no_net");
+    // no interface but loopback, and even that is down (B3)
+    let recipe = r#"
+set -e
+test "$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | wc -l)" = 0
+echo ok > "$XIN_OUT/payload/f"
+"#;
+    let input = raw(vec![("probe", node(recipe, &[], true))]);
+    let mut driver = driver_for(&td);
+    driver.container = mode;
+    let (_, _, out) = resolve(input, driver).unwrap();
+    assert!(out.success, "failures: {:?}", out.failures);
+}
+
+#[test]
+fn container_and_direct_builds_agree_on_output_hashes() {
+    let Some(mode) = bwrap_mode() else { return };
+    let mk = || {
+        raw(vec![
+            (
+                "base",
+                node(r#"echo hi > "$XIN_OUT/payload/f""#, &[], false),
+            ),
+            (
+                "top",
+                node(
+                    r#"cat "$XIN_INPUTS/base/payload/f" "$XIN_INPUTS/base/payload/f" > "$XIN_OUT/payload/g"
+ln -s "../../$XIN_INPUT_HASH_base" "$XIN_OUT/runtime-inputs/base""#,
+                    &[("base", "base")],
+                    true,
+                ),
+            ),
+        ])
+    };
+    let td_direct = TestDir::new("mode_agree_direct");
+    let (r1, _, out1) = resolve(mk(), driver_for(&td_direct)).unwrap();
+    let td_cont = TestDir::new("mode_agree_container");
+    let mut driver = driver_for(&td_cont);
+    driver.container = mode;
+    let (r2, _, out2) = resolve(mk(), driver).unwrap();
+    assert!(out1.success && out2.success);
+    for name in ["base", "top"] {
+        let a = realized_output(&out1.statuses[r1.dag.id_of(name).unwrap().idx()]);
+        let b = realized_output(&out2.statuses[r2.dag.id_of(name).unwrap().idx()]);
+        assert_eq!(a, b, "{name}: container and direct builds must reproduce");
+    }
+}

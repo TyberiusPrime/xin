@@ -11,8 +11,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use xin_dag::config::OnFailure;
+use xin_dag::config::{OnFailure, XinConfig};
 use xin_dag::schema::TomlStore;
+use xin_driver::{ContainerMode, ContainerPref};
 use xin_resolver::input::{BuilderType, Cores};
 use xin_resolver::resolver::NodeStatus;
 use xin_resolver::sim::Policy;
@@ -57,6 +58,21 @@ enum Cmd {
         /// skip results/ symlinks and gc-root registration
         #[arg(long)]
         no_link: bool,
+        /// build isolation: auto (bwrap when available), bwrap, none
+        #[arg(long, value_name = "MODE")]
+        container: Option<String>,
+    },
+    /// Open an interactive container with a node and its runtime closure
+    /// mounted at /xin/<output-hash> (realizes the node first if needed)
+    Shell {
+        node: String,
+        file: Option<String>,
+        /// do not mount the host /nix into the container
+        #[arg(long)]
+        no_nix: bool,
+        /// command to run instead of an interactive bash (after `--`)
+        #[arg(last = true)]
+        cmd: Vec<String>,
     },
     /// What is present, cached, or would need building — runs no builds
     Status {
@@ -118,6 +134,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             keep_going,
             trace,
             no_link,
+            container,
         } => cmd_build(
             cli.format,
             config,
@@ -126,7 +143,14 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             *keep_going,
             *trace,
             *no_link,
+            container.as_deref(),
         ),
+        Cmd::Shell {
+            node,
+            file,
+            no_nix,
+            cmd,
+        } => cmd_shell(config, file.as_deref(), node, *no_nix, cmd),
         Cmd::Status { file, trace } => cmd_status(cli.format, config, file.as_deref(), *trace),
         Cmd::Eval { file } => cmd_eval(cli.format, config, file.as_deref()),
         Cmd::Dag { file } => cmd_dag(cli.format, config, file.as_deref()),
@@ -148,9 +172,22 @@ struct ResultLink {
 struct BuildReport {
     success: bool,
     policy: String,
+    /// how builds were isolated: "bwrap" or "none"
+    container: String,
     builds_run: u32,
     nodes: Vec<report::NodeReport>,
     results: Vec<ResultLink>,
+}
+
+/// CLI flag beats config beats "auto"; then resolve against the host.
+fn container_mode(flag: Option<&str>, config: Option<&XinConfig>) -> Result<ContainerMode, String> {
+    let word = flag
+        .or(config.map(|c| c.container.as_str()))
+        .unwrap_or("auto");
+    let pref = ContainerPref::parse(word).ok_or_else(|| {
+        format!("container must be \"auto\", \"bwrap\" or \"none\", found {word:?}")
+    })?;
+    ContainerMode::detect(pref).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -162,10 +199,12 @@ fn cmd_build(
     keep_going: bool,
     trace: bool,
     no_link: bool,
+    container: Option<&str>,
 ) -> Result<ExitCode, String> {
     let config = load::load_config(config_arg)?;
     let loaded = load::load_bundle(file, config.as_ref())?;
     let mut driver = load::make_driver(&loaded.bundle).map_err(|e| e.to_string())?;
+    driver.container = container_mode(container, config.as_ref())?;
     let mut resolver = load::make_resolver(&loaded)?;
     resolver.trace.enabled = trace;
 
@@ -235,6 +274,7 @@ fn cmd_build(
             Policy::KeepGoing => "keep-going".into(),
             Policy::FailFast => "fail-fast".into(),
         },
+        container: driver.container.name().into(),
         builds_run: driver.builds_run,
         nodes,
         results,
@@ -671,4 +711,114 @@ fn cmd_store(
     }
     emit(format, &reports, human);
     Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------- shell
+
+/// Realize one node (whatever the DAG's own targets say), then drop the
+/// user into a bwrap container whose /xin holds the node's entire runtime
+/// closure at the canonical relocatable places — the same view a build
+/// gets, plus network, the host cwd at /xin/work, and (by default) the
+/// host /nix so jupyter & friends are available (B8).
+fn cmd_shell(
+    config_arg: Option<&std::path::Path>,
+    file: Option<&str>,
+    node: &str,
+    no_nix: bool,
+    cmd: &[String],
+) -> Result<ExitCode, String> {
+    let config = load::load_config(config_arg)?;
+    let mut loaded = load::load_bundle(file, config.as_ref())?;
+
+    // the requested node is the only target of this run: prune to its
+    // closure, realize exactly it
+    let mut found = false;
+    for (name, raw_node) in loaded.bundle.raw.nodes.iter_mut() {
+        raw_node.is_target = name.as_str() == node;
+        found |= raw_node.is_target;
+    }
+    if !found {
+        return Err(format!("no node named {node} in {}", loaded.path.display()));
+    }
+
+    let ContainerMode::Bwrap { bwrap } =
+        ContainerMode::detect(ContainerPref::Bwrap).map_err(|e| e.to_string())?
+    else {
+        unreachable!("ContainerPref::Bwrap never resolves to Direct");
+    };
+
+    let mut driver = load::make_driver(&loaded.bundle).map_err(|e| e.to_string())?;
+    driver.container = container_mode(None, config.as_ref())?;
+    let mut resolver = load::make_resolver(&loaded)?;
+    let out = xin_driver::run_to_quiescence(&mut resolver, &mut driver)
+        .map_err(|e| format!("io error while realizing {node}: {e}"))?;
+    let id = resolver.dag.id_of(node).expect("target survives pruning");
+    let NodeStatus::Realized { output, .. } = &out.statuses[id.idx()] else {
+        let reports = report::node_reports(&out, &resolver.dag, false);
+        return Err(format!(
+            "could not realize {node}:\n{}",
+            report::render_nodes(&reports)
+        ));
+    };
+
+    // mount set: the on-disk runtime closure, wherever its members live
+    let stores: Vec<xin_driver::LocalStore> = loaded
+        .bundle
+        .locations
+        .values()
+        .filter_map(|loc| match loc {
+            xin_dag::StoreLocation::Local { path, .. } => xin_driver::LocalStore::open(path).ok(),
+            xin_dag::StoreLocation::Remote { .. } => None,
+        })
+        .collect();
+    let refs: Vec<&xin_driver::LocalStore> = stores.iter().collect();
+    let closure = xin_driver::runtime_closure(&refs, *output);
+
+    let mut bw = xin_driver::Bwrap::new(&bwrap, true); // interactive: network stays
+    bw.host_toolchain(!no_nix);
+    let mut node_dir = None;
+    for oh in &closure {
+        let dir = refs
+            .iter()
+            .map(|s| s.output_dir(*oh))
+            .find(|d| d.is_dir())
+            .ok_or_else(|| {
+                format!("runtime closure member {oh} is in no local store (gc'd? run xin build)")
+            })?;
+        if oh == output {
+            node_dir = Some(dir.clone());
+        }
+        bw.ro_bind(&dir, format!("/xin/{oh}"));
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    bw.bind(&cwd, "/xin/work");
+    bw.chdir("/xin/work");
+    bw.setenv("XIN_NODE", format!("/xin/{output}"));
+    bw.setenv("HOME", "/xin/work");
+    if let Ok(term) = std::env::var("TERM") {
+        bw.setenv("TERM", term);
+    }
+    // the node's own executables first on PATH, if it ships any
+    if node_dir.is_some_and(|d| d.join("payload").join("bin").is_dir()) {
+        let host_path = std::env::var("PATH").unwrap_or_default();
+        bw.setenv("PATH", format!("/xin/{output}/payload/bin:{host_path}"));
+    }
+
+    let argv: Vec<&str> = if cmd.is_empty() {
+        vec!["bash"]
+    } else {
+        cmd.iter().map(String::as_str).collect()
+    };
+    eprintln!(
+        "xin shell: {node} at /xin/{output} ({} output(s) mounted, {}, cwd → /xin/work)",
+        closure.len(),
+        if no_nix { "no /nix" } else { "/nix mounted" },
+    );
+    let status = bw
+        .command(&argv)
+        .status()
+        .map_err(|e| format!("launching container: {e}"))?;
+    Ok(ExitCode::from(
+        status.code().unwrap_or(1).clamp(0, 255) as u8
+    ))
 }

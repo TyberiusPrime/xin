@@ -212,6 +212,15 @@ fn close_over_runtime_refs(stores: &[&LocalStore], live: &mut BTreeSet<OutputHas
     }
 }
 
+/// The runtime closure of one output as recorded on disk: the output plus
+/// everything reachable over declared runtime refs across the given stores.
+/// This is the mount set for an interactive container (`xin shell`).
+pub fn runtime_closure(stores: &[&LocalStore], root: OutputHash) -> BTreeSet<OutputHash> {
+    let mut live = BTreeSet::from([root]);
+    close_over_runtime_refs(stores, &mut live);
+    live
+}
+
 /// Phase 2: sweep one store against the global live set.
 fn sweep_store(
     store: &LocalStore,

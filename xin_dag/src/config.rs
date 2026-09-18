@@ -24,6 +24,7 @@ struct TomlConfig {
     /// where target symlinks land; relative to the config file's directory
     results: Option<String>,
     on_failure: Option<String>,
+    container: Option<String>,
     #[serde(default)]
     stores: BTreeMap<String, TomlStore>,
 }
@@ -45,6 +46,9 @@ pub struct XinConfig {
     /// absolute after load; defaults to `<dir>/results` (A7)
     pub results: PathBuf,
     pub on_failure: OnFailure,
+    /// build isolation: "auto" (default; bwrap when available), "bwrap"
+    /// (required), or "none" — interpreted by the driver
+    pub container: String,
     /// local paths are absolute after load
     pub stores: BTreeMap<String, TomlStore>,
 }
@@ -81,6 +85,13 @@ impl XinConfig {
                 )));
             }
         };
+        let container = raw.container.unwrap_or_else(|| "auto".into());
+        if !matches!(container.as_str(), "auto" | "bwrap" | "none") {
+            return Err(DagError::Value(format!(
+                "{}: container must be \"auto\", \"bwrap\" or \"none\", found {container:?}",
+                path.display()
+            )));
+        }
         let results = {
             let r = PathBuf::from(raw.results.as_deref().unwrap_or("results"));
             if r.is_relative() { dir.join(r) } else { r }
@@ -93,6 +104,7 @@ impl XinConfig {
             primary: raw.primary,
             results,
             on_failure,
+            container,
             stores,
         })
     }

@@ -297,6 +297,9 @@ fn config_rejects_unknown_policy_words_and_fields() {
         XinConfig::load(&p).is_err(),
         "unknown fields must be rejected"
     );
+    let p = write_config(&dir, "container = \"starship\"\n");
+    let err = XinConfig::load(&p).unwrap_err().to_string();
+    assert!(err.contains("bwrap"), "{err}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

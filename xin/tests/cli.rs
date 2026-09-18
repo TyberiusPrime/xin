@@ -288,3 +288,74 @@ let xin = import "xin.ncl" in
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("main") && err.contains("both"), "{err}");
 }
+
+fn have_bwrap() -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join("bwrap").is_file()))
+        .unwrap_or(false)
+}
+
+#[test]
+fn shell_mounts_the_runtime_closure() {
+    if !have_bwrap() {
+        eprintln!("skipping shell test: no bwrap in PATH");
+        return;
+    }
+    let t = TestDir::new("cli_shell");
+    t.write("xin.config.toml", CONFIG);
+    t.write("demo.xin.ncl", CHAIN_DAG);
+
+    // shell realizes the node itself (no prior xin build), then the
+    // in-container view resolves runtime refs through /xin relative links
+    let script = format!(
+        r#"set -e
+cat "$XIN_NODE/payload/shout"
+cat "$XIN_NODE/runtime-inputs/base/payload/greeting"
+test -d /nix
+test "$PWD" = /xin/work
+test ! -e "{host}"
+"#,
+        host = t.path.join("store").display()
+    );
+    let out = t.xin(&["shell", "top", "demo", "--", "bash", "-c", &script]);
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "HELLO\nhello\n");
+
+    // exit codes pass through
+    let out = t.xin(&["shell", "top", "demo", "--", "bash", "-c", "exit 7"]);
+    assert_eq!(out.status.code(), Some(7));
+
+    // unknown node names are user errors
+    let out = t.xin(&["shell", "nonesuch", "demo"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn container_flag_and_config_select_the_build_isolation() {
+    let t = TestDir::new("cli_container_none");
+    t.write("xin.config.toml", CONFIG);
+    t.write("demo.xin.ncl", CHAIN_DAG);
+    let rep = t.xin_json(&["build", "demo", "--container", "none"]);
+    assert_eq!(rep["success"], true);
+    assert_eq!(rep["container"], "none");
+
+    // config-level default; auto resolves per host, so just assert the
+    // report names a valid mode and the build still works
+    let t2 = TestDir::new("cli_container_cfg");
+    t2.write(
+        "xin.config.toml",
+        "container = \"none\"\n[stores.main]\ntype = \"local\"\npath = \"./store\"\n",
+    );
+    t2.write("demo.xin.ncl", CHAIN_DAG);
+    let rep = t2.xin_json(&["build", "demo"]);
+    assert_eq!(rep["success"], true);
+    assert_eq!(rep["container"], "none");
+
+    let out = t2.xin(&["build", "demo", "--container", "starship"]);
+    assert_eq!(out.status.code(), Some(2));
+}
