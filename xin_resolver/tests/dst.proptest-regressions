@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b464a8c4ed1603ed9ac4015bcf20719348a9e65a559bca69dd9aeeed0bc91e2a # shrinks to spec = [([], false, 0), ([(true, false)], false, 0), ([], false, 0), ([(true, true)], false, 0), ([(false, false), (false, false), (true, false), (true, false)], false, 2)], remote_mask = 2170573063568547308

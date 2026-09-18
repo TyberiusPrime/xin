@@ -12,7 +12,7 @@ use crate::events::{
 use crate::failure::BuildLog;
 use crate::hashes::{InputHash, OutputHash, hash_bytes};
 use crate::input::{Dag, NodeId, StoreDef, StoreName};
-use crate::resolver::{Outcome, Resolver};
+use crate::resolver::{NodeStatus, Outcome, Resolver};
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SimStore {
@@ -40,7 +40,7 @@ pub enum BuildScript {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SimWorld {
     pub stores: BTreeMap<StoreName, (StoreDef, SimStore)>,
     pub builds: BTreeMap<NodeId, BuildScript>,
@@ -280,16 +280,116 @@ pub fn drive_policy(
     policy: Policy,
 ) -> Outcome {
     let mut rng = seed.wrapping_mul(2685821657736338717).wrapping_add(1);
+    drive_impl(resolver, world, policy, move |len| {
+        (xorshift(&mut rng) % len as u64) as usize
+    })
+}
+
+/// Schedule as data (resolver-architecture.md §9): each byte picks the next
+/// pending effect (`choices[step] % pending.len()`); past the end the
+/// first pending effect completes. Proptest can generate and *shrink* this
+/// to a minimal reordering when a property fails.
+pub fn drive_with_choices(
+    resolver: &mut Resolver,
+    world: &mut SimWorld,
+    choices: &[u8],
+    policy: Policy,
+) -> Outcome {
+    let mut it = choices.iter().copied();
+    drive_impl(resolver, world, policy, move |len| {
+        it.next().map(|c| c as usize % len).unwrap_or(0)
+    })
+}
+
+fn drive_impl(
+    resolver: &mut Resolver,
+    world: &mut SimWorld,
+    policy: Policy,
+    mut pick: impl FnMut(usize) -> usize,
+) -> Outcome {
     let mut pending: Vec<Effect> = resolver.start();
     while !pending.is_empty() {
-        let i = (xorshift(&mut rng) % pending.len() as u64) as usize;
+        let i = pick(pending.len());
         let eff = pending.swap_remove(i);
-        if policy == Policy::FailFast && !resolver.failures.is_empty() && eff.cancellable() {
-            let tok = eff.tok().unwrap();
-            pending.extend(resolver.apply(Event::Cancelled { tok }));
-        } else if let Some(ev) = world.execute(eff) {
-            pending.extend(resolver.apply(ev));
-        }
+        pending.extend(step(resolver, world, policy, eff));
     }
     resolver.quiesced()
+}
+
+/// Deliver one effect under the policy: fail-fast cancels cancellable work
+/// once a failure exists; everything else executes against the world.
+fn step(resolver: &mut Resolver, world: &mut SimWorld, policy: Policy, eff: Effect) -> Vec<Effect> {
+    if policy == Policy::FailFast && !resolver.failures.is_empty() && eff.cancellable() {
+        let tok = eff.tok().unwrap();
+        resolver.apply(Event::Cancelled { tok })
+    } else if let Some(ev) = world.execute(eff) {
+        resolver.apply(ev)
+    } else {
+        Vec::new()
+    }
+}
+
+/// A schedule-invariant rendering of an outcome: statuses are canonicalized
+/// through the failure table (kind + origin instead of arrival-ordered
+/// failure ids), so runs whose only difference is *when* independent
+/// failures were discovered compare equal.
+pub fn canonical_statuses(out: &Outcome) -> Vec<String> {
+    out.statuses
+        .iter()
+        .map(|s| match s {
+            NodeStatus::Realized { output, store } => format!("realized {output:?} in {store}"),
+            NodeStatus::Named { output } => format!("named {output:?}"),
+            NodeStatus::Incomplete => "incomplete".to_owned(),
+            NodeStatus::Failed { failure } => {
+                let rec = &out.failures[failure.idx()];
+                format!("failed {:?} at {:?}", rec.kind, rec.origin)
+            }
+        })
+        .collect()
+}
+
+/// The confluence fingerprint: canonical statuses plus the complete store
+/// state. Two keep-going runs of one scenario must produce identical
+/// fingerprints under every schedule.
+pub fn fingerprint(out: &Outcome, world: &SimWorld) -> String {
+    format!("{:?}\n{:?}", canonical_statuses(out), world.stores)
+}
+
+/// Model checking for small scenarios (§9): enumerate *every* interleaving
+/// by forking (resolver, world, pending) at each choice point. Returns the
+/// set of distinct fingerprints and the number of complete runs explored.
+/// Panics past `max_runs` — that means the scenario is too big to
+/// enumerate, not that the resolver is wrong.
+pub fn explore_all_interleavings(
+    mk: impl Fn() -> (Resolver, SimWorld),
+    policy: Policy,
+    max_runs: usize,
+) -> (BTreeSet<String>, usize) {
+    let (mut r0, w0) = mk();
+    let p0 = r0.start();
+    let mut stack = vec![(r0, w0, p0)];
+    let mut fingerprints = BTreeSet::new();
+    let mut runs = 0usize;
+    while let Some((r, w, pending)) = stack.pop() {
+        if pending.is_empty() {
+            let mut r = r;
+            let out = r.quiesced();
+            fingerprints.insert(fingerprint(&out, &w));
+            runs += 1;
+            assert!(
+                runs <= max_runs,
+                "interleaving explosion: scenario too big to enumerate"
+            );
+            continue;
+        }
+        for i in 0..pending.len() {
+            let mut r2 = r.clone();
+            let mut w2 = w.clone();
+            let mut p2 = pending.clone();
+            let eff = p2.swap_remove(i);
+            p2.extend(step(&mut r2, &mut w2, policy, eff));
+            stack.push((r2, w2, p2));
+        }
+    }
+    (fingerprints, runs)
 }
