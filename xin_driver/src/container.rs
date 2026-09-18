@@ -1,73 +1,95 @@
-//! Containerized execution via bubblewrap (B3/B4).
+//! The mandatory build sandbox: bubblewrap + a bootstrap busybox (B3/B4).
 //!
-//! Builds run under `--unshare-all` (no network — B3) with the virtualized
-//! layout below `/xin` from B4: the staged output at `/xin/out`, every
-//! input at `/xin/<output-hash>`, aliases at `/xin/inputs/by-name/<name>`
-//! (relative symlinks `../../<output-hash>`, so the in-container view is
-//! exactly the relocatable representation the store uses). The host is
-//! invisible except for the toolchain binds below.
+//! There is no unsandboxed build path. Every recipe runs under
+//! `--unshare-all` (no network — B3) in a container whose *entire* world is
+//! the B4 layout below `/xin`: the staged output at `/xin/out`, every input
+//! at `/xin/<output-hash>`, aliases at `/xin/inputs/by-name/<name>`
+//! (relative `../../<output-hash>` symlinks — the store's relocatable
+//! representation), and `/xin/bootstrap`. No `/nix`, no `/usr`, no host
+//! `PATH`: toolchains beyond the bootstrap are ordinary build inputs, and
+//! recipes reference them through `$XIN_INPUTS` (e.g.
+//! `exec "$XIN_INPUTS/python/payload/bin/python3" ...`).
 //!
-//! Toolchain impurity, deliberate for now: `/nix`, `/run/current-system`,
-//! `/usr`, `/bin`, `/lib`, `/lib64` are bound read-only and `PATH` passes
-//! through, because a shell and coreutils have to come from *somewhere*
-//! until toolchains are ordinary build inputs (B3 TODO). Everything else —
-//! home, host tmp, the project tree, the network — is gone.
+//! The bootstrap is a single *statically linked* busybox (the dev flake
+//! provides `pkgsStatic.busybox`) staged as `/xin/bootstrap/busybox` plus
+//! one symlink per applet; `PATH=/xin/bootstrap` and recipes are executed
+//! by `/xin/bootstrap/sh`. It is the one impurity the input-hash does not
+//! yet cover — pinning it as a fixed-output input is the designated fix
+//! (design.md B3 TODO); keeping it minimal and static keeps the surface
+//! small in the meantime.
 
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// What the config / CLI asked for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ContainerPref {
-    /// bwrap when available, direct execution otherwise
-    Auto,
-    /// bwrap or error
-    Bwrap,
-    /// direct execution (the pre-container builder)
-    None,
-}
-
-impl ContainerPref {
-    pub fn parse(s: &str) -> Option<ContainerPref> {
-        match s {
-            "auto" => Some(ContainerPref::Auto),
-            "bwrap" => Some(ContainerPref::Bwrap),
-            "none" => Some(ContainerPref::None),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
-pub enum ContainerMode {
-    Direct,
-    Bwrap { bwrap: PathBuf },
+pub struct Sandbox {
+    pub bwrap: PathBuf,
+    /// the statically linked bootstrap busybox
+    pub busybox: PathBuf,
+    /// its applet names (from `busybox --list`), the bootstrap symlink farm
+    applets: Vec<String>,
 }
 
-impl ContainerMode {
-    pub fn detect(pref: ContainerPref) -> io::Result<ContainerMode> {
-        match pref {
-            ContainerPref::None => Ok(ContainerMode::Direct),
-            ContainerPref::Bwrap => match find_in_path("bwrap") {
-                Some(bwrap) => Ok(ContainerMode::Bwrap { bwrap }),
-                None => Err(io::Error::other(
-                    "container mode \"bwrap\" requested but no bwrap in PATH",
-                )),
-            },
-            ContainerPref::Auto => Ok(match find_in_path("bwrap") {
-                Some(bwrap) => ContainerMode::Bwrap { bwrap },
-                None => ContainerMode::Direct,
-            }),
+impl Sandbox {
+    /// Builds are sandbox-mandatory, so failing here fails loudly and
+    /// early. The bootstrap comes from (in order): the explicit override
+    /// (config `bootstrap = ...`), `$XIN_BOOTSTRAP`, or `busybox` on PATH.
+    pub fn detect(bootstrap: Option<&Path>) -> io::Result<Sandbox> {
+        let bwrap = find_in_path("bwrap").ok_or_else(|| {
+            io::Error::other(
+                "builds are sandboxed, no exceptions: bwrap is required but not in PATH",
+            )
+        })?;
+        let busybox = bootstrap
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("XIN_BOOTSTRAP").map(PathBuf::from))
+            .or_else(|| find_in_path("busybox"))
+            .ok_or_else(|| {
+                io::Error::other(
+                    "no bootstrap busybox: set `bootstrap` in xin.config.toml, $XIN_BOOTSTRAP, \
+                     or put a static busybox in PATH (the dev flake ships pkgsStatic.busybox)",
+                )
+            })?;
+        let list = Command::new(&busybox).arg("--list").output()?;
+        if !list.status.success() {
+            return Err(io::Error::other(format!(
+                "{} does not answer `--list`; the bootstrap must be a full static busybox \
+                 (nixpkgs' minimal bootstrap busybox is ash-only and will not do)",
+                busybox.display()
+            )));
         }
+        let applets: Vec<String> = String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|a| !a.is_empty() && *a != "busybox")
+            .map(str::to_owned)
+            .collect();
+        if !applets.iter().any(|a| a == "sh") {
+            return Err(io::Error::other(format!(
+                "{} has no `sh` applet; recipes cannot run",
+                busybox.display()
+            )));
+        }
+        Ok(Sandbox {
+            bwrap,
+            busybox,
+            applets,
+        })
     }
 
-    pub fn name(&self) -> &'static str {
-        match self {
-            ContainerMode::Direct => "none",
-            ContainerMode::Bwrap { .. } => "bwrap",
+    /// Materialize the bootstrap into `<dir>/bootstrap`: a *copy* of the
+    /// busybox binary (the container cannot see the host path a symlink
+    /// would point at) plus one relative symlink per applet.
+    pub fn stage_bootstrap(&self, dir: &Path) -> io::Result<PathBuf> {
+        let boot = dir.join("bootstrap");
+        std::fs::create_dir_all(&boot)?;
+        std::fs::copy(&self.busybox, boot.join("busybox"))?;
+        for applet in &self.applets {
+            std::os::unix::fs::symlink("busybox", boot.join(applet))?;
         }
+        Ok(boot)
     }
 }
 
@@ -138,22 +160,6 @@ impl Bwrap {
     pub fn chdir(&mut self, dir: impl AsRef<Path>) {
         self.args.push("--chdir".into());
         self.args.push(dir.as_ref().into());
-    }
-
-    /// The documented toolchain impurity: host shell + tools, read-only.
-    /// `with_nix` = false drops `/nix` (and `/run/current-system`, which
-    /// only points into it) for containers that bring their own tools.
-    pub fn host_toolchain(&mut self, with_nix: bool) {
-        if with_nix {
-            self.ro_bind_try("/nix", "/nix");
-            self.ro_bind_try("/run/current-system", "/run/current-system");
-        }
-        for d in ["/usr", "/bin", "/lib", "/lib64", "/etc/ssl", "/etc/static"] {
-            self.ro_bind_try(d, d);
-        }
-        if let Ok(path) = std::env::var("PATH") {
-            self.setenv("PATH", path);
-        }
     }
 
     pub fn command(&self, argv: &[impl AsRef<std::ffi::OsStr>]) -> Command {

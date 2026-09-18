@@ -18,7 +18,7 @@ use xin_resolver::sim::Policy;
 use xin_resolver::{Resolver, failure::BuildLog};
 
 use crate::builder::{BuildRun, run_process_build};
-use crate::container::ContainerMode;
+use crate::container::Sandbox;
 use crate::local_store::LocalStore;
 
 pub enum Backend {
@@ -47,8 +47,10 @@ pub struct Driver {
     /// answer store queries truthfully but refuse builds and downloads
     /// (with `QUERY_ONLY_EXIT`); the basis of `xin status`
     pub query_only: bool,
-    /// how Process builds execute; `Direct` unless the host opts in
-    pub container: ContainerMode,
+    /// the mandatory build sandbox; `None` is only viable for drivers that
+    /// never build (query-only) — a build without it is an error, not a
+    /// fallback to unsandboxed execution
+    pub sandbox: Option<Sandbox>,
 }
 
 impl Driver {
@@ -58,7 +60,7 @@ impl Driver {
             staged: BTreeMap::new(),
             builds_run: 0,
             query_only: false,
-            container: ContainerMode::Direct,
+            sandbox: None,
         }
     }
 
@@ -157,7 +159,12 @@ impl Driver {
                             .iter()
                             .filter_map(|(_, oh)| self.find_output(*oh).map(|p| (*oh, p)))
                             .collect();
-                        let mode = self.container.clone();
+                        let sandbox = self.sandbox.clone().ok_or_else(|| {
+                            io::Error::other(
+                                "a build was demanded but no sandbox is configured; \
+                                 builds never run unsandboxed (Sandbox::detect)",
+                            )
+                        })?;
                         let target = self.local_mut(&store);
                         let BuildRun {
                             outcome,
@@ -169,7 +176,7 @@ impl Driver {
                             &recipe,
                             &inputs,
                             |oh| found.get(&oh).cloned(),
-                            &mode,
+                            &sandbox,
                         )?;
                         if let xin_resolver::events::BuildOutcome::Success { output, .. } = &outcome
                         {

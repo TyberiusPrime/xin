@@ -282,6 +282,7 @@ fn config_loads_stores_policy_and_absolutizes_paths() {
         std::path::Path::new(path).is_absolute(),
         "store path {path} not absolutized"
     );
+    assert!(cfg.bootstrap.is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -297,9 +298,22 @@ fn config_rejects_unknown_policy_words_and_fields() {
         XinConfig::load(&p).is_err(),
         "unknown fields must be rejected"
     );
-    let p = write_config(&dir, "container = \"starship\"\n");
-    let err = XinConfig::load(&p).unwrap_err().to_string();
-    assert!(err.contains("bwrap"), "{err}");
+    let p = write_config(&dir, "container = \"none\"\n");
+    assert!(
+        XinConfig::load(&p).is_err(),
+        "there is no container opt-out knob; the sandbox is mandatory"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn config_bootstrap_path_is_absolutized() {
+    let dir = std::env::temp_dir().join(format!("xin-cfg-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = write_config(&dir, "bootstrap = \"./tools/busybox\"\n");
+    let cfg = XinConfig::load(&p).unwrap();
+    let b = cfg.bootstrap.unwrap();
+    assert!(b.is_absolute() && b.ends_with("tools/busybox"), "{b:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

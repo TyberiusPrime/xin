@@ -73,6 +73,7 @@ let xin = import "xin.ncl" in
     base = { recipe = m%"echo hello > "$XIN_OUT/payload/greeting""% },
     top = {
       recipe = m%"
+        test ! -e /nix
         tr a-z A-Z < "$XIN_INPUTS/base/payload/greeting" > "$XIN_OUT/payload/shout"
         ln -s "../../$XIN_INPUT_HASH_base" "$XIN_OUT/runtime-inputs/base"
       "%,
@@ -332,30 +333,5 @@ test ! -e "{host}"
 
     // unknown node names are user errors
     let out = t.xin(&["shell", "nonesuch", "demo"]);
-    assert_eq!(out.status.code(), Some(2));
-}
-
-#[test]
-fn container_flag_and_config_select_the_build_isolation() {
-    let t = TestDir::new("cli_container_none");
-    t.write("xin.config.toml", CONFIG);
-    t.write("demo.xin.ncl", CHAIN_DAG);
-    let rep = t.xin_json(&["build", "demo", "--container", "none"]);
-    assert_eq!(rep["success"], true);
-    assert_eq!(rep["container"], "none");
-
-    // config-level default; auto resolves per host, so just assert the
-    // report names a valid mode and the build still works
-    let t2 = TestDir::new("cli_container_cfg");
-    t2.write(
-        "xin.config.toml",
-        "container = \"none\"\n[stores.main]\ntype = \"local\"\npath = \"./store\"\n",
-    );
-    t2.write("demo.xin.ncl", CHAIN_DAG);
-    let rep = t2.xin_json(&["build", "demo"]);
-    assert_eq!(rep["success"], true);
-    assert_eq!(rep["container"], "none");
-
-    let out = t2.xin(&["build", "demo", "--container", "starship"]);
     assert_eq!(out.status.code(), Some(2));
 }

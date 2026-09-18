@@ -135,9 +135,12 @@
           '';
           nativeBuildInputs = [
             pkgs.bacon
+            pkgs.bubblewrap
             pkgs.cargo-nextest
             #pkgs.mold
             #pkgs.pkg-config
+            # xin's build-sandbox bootstrap: a full static busybox
+            pkgs.pkgsStatic.busybox
             pkgs.ripgrep
             mypython
             rust

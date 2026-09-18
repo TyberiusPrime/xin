@@ -1,22 +1,20 @@
 //! The Process builder: stage a B4-shaped build dir in temp/, then run the
-//! recipe either directly on the host (`ContainerMode::Direct`) or inside a
-//! bubblewrap container (`ContainerMode::Bwrap`) with the staged dirs bound
-//! at the canonical B4 places:
+//! recipe in the mandatory sandbox (see `container`) with the staged dirs
+//! bound at the canonical B4 places:
 //!
 //! ```text
 //! <build>/recipe.sh                     -> /xin/recipe.sh          (ro)
-//! <build>/inputs/by-name/<alias>          symlinks; direct mode: absolute
-//!                                         store paths, container mode:
-//!                                         ../../<oh> under /xin/inputs (ro)
+//! <build>/bootstrap/                    -> /xin/bootstrap  (PATH)  (ro)
+//! <build>/inputs/by-name/<alias>        -> /xin/inputs/by-name     (ro)
+//!                                          (relative ../../<oh> symlinks)
 //! <build>/out/{payload,runtime-inputs}/ -> /xin/out                (rw)
 //! <build>/work/                         -> /xin/work  (cwd, HOME)  (rw)
 //! each input <store>/outputs/<sh>/<oh>  -> /xin/<oh>               (ro)
 //! ```
 //!
-//! Container builds have no network (B3) and see none of the host beyond
-//! the toolchain binds (see `container`). The two modes produce the same
-//! *output tree* for recipes that only use their declared inputs — which is
-//! exactly the class of recipe xin is for.
+//! Recipes execute as `/xin/bootstrap/sh /xin/recipe.sh` — busybox ash,
+//! not bash. Anything richer is a declared input:
+//! `exec "$XIN_INPUTS/bash/payload/bin/bash" ...`.
 //!
 //! Environment: `XIN_OUT`, `XIN_PAYLOAD`, `XIN_INPUTS`, and per input
 //! `XIN_INPUT_HASH_<ALIAS>` ('-' mapped to '_') so a script can declare a
@@ -31,14 +29,13 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::process::Command;
 
 use xin_resolver::events::BuildOutcome;
 use xin_resolver::failure::BuildLog;
 use xin_resolver::hashes::{InputHash, OutputHash};
 use xin_resolver::input::InputName;
 
-use crate::container::{Bwrap, ContainerMode};
+use crate::container::{Bwrap, Sandbox};
 use crate::local_store::{LocalStore, read_runtime_refs};
 use crate::tree_hash::hash_tree;
 
@@ -58,78 +55,52 @@ pub fn run_process_build(
     recipe: &[u8],
     inputs: &[(InputName, OutputHash)],
     find_input: impl Fn(OutputHash) -> Option<PathBuf>,
-    mode: &ContainerMode,
+    sandbox: &Sandbox,
 ) -> io::Result<BuildRun> {
     let ih_short = &input.to_string()[..8];
     let dir = store.new_temp_dir(&format!("build-{ih_short}"))?;
     let out = dir.join("out");
     std::fs::create_dir_all(out.join("payload"))?;
     std::fs::create_dir_all(out.join("runtime-inputs"))?;
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work)?;
     let by_name = dir.join("inputs").join("by-name");
     std::fs::create_dir_all(&by_name)?;
-    let containered = matches!(mode, ContainerMode::Bwrap { .. });
-    let mut resolved: Vec<(&InputName, OutputHash, PathBuf)> = Vec::new();
+    let boot = sandbox.stage_bootstrap(&dir)?;
+    let script = dir.join("recipe.sh");
+    std::fs::write(&script, recipe)?;
+
+    let mut bw = Bwrap::new(&sandbox.bwrap, false); // B3: no network
+    let mut bound = std::collections::BTreeSet::new();
     for (alias, oh) in inputs {
         let src = find_input(*oh).ok_or_else(|| {
             io::Error::other(format!(
                 "input {oh:?} for alias {alias} is not in any local store"
             ))
         })?;
-        // container mode gets the canonical relocatable link form (B4);
-        // it resolves against /xin, not against the host store layout
-        if containered {
-            std::os::unix::fs::symlink(format!("../../{oh}"), by_name.join(alias.as_str()))?;
-        } else {
-            std::os::unix::fs::symlink(&src, by_name.join(alias.as_str()))?;
+        // the alias link carries the canonical relocatable form (B4); it
+        // resolves against /xin, not against the host store layout
+        std::os::unix::fs::symlink(format!("../../{oh}"), by_name.join(alias.as_str()))?;
+        if bound.insert(*oh) {
+            bw.ro_bind(src, format!("/xin/{oh}"));
         }
-        resolved.push((alias, *oh, src));
+        bw.setenv(
+            &format!("XIN_INPUT_HASH_{}", alias.as_str().replace('-', "_")),
+            oh.to_string(),
+        );
     }
-    let script = dir.join("recipe.sh");
-    std::fs::write(&script, recipe)?;
-
-    let mut cmd = match mode {
-        ContainerMode::Direct => {
-            let mut cmd = Command::new("bash");
-            cmd.arg(&script)
-                .current_dir(&dir)
-                .env("XIN_OUT", &out)
-                .env("XIN_PAYLOAD", out.join("payload"))
-                .env("XIN_INPUTS", &by_name);
-            for (alias, oh, _) in &resolved {
-                cmd.env(
-                    format!("XIN_INPUT_HASH_{}", alias.as_str().replace('-', "_")),
-                    oh.to_string(),
-                );
-            }
-            cmd
-        }
-        ContainerMode::Bwrap { bwrap } => {
-            let work = dir.join("work");
-            std::fs::create_dir_all(&work)?;
-            let mut bw = Bwrap::new(bwrap, false); // B3: no network
-            bw.host_toolchain(true);
-            let mut bound = std::collections::BTreeSet::new();
-            for (alias, oh, src) in &resolved {
-                if bound.insert(*oh) {
-                    bw.ro_bind(src, format!("/xin/{oh}"));
-                }
-                bw.setenv(
-                    &format!("XIN_INPUT_HASH_{}", alias.as_str().replace('-', "_")),
-                    oh.to_string(),
-                );
-            }
-            bw.bind(&out, "/xin/out");
-            bw.ro_bind(dir.join("inputs"), "/xin/inputs");
-            bw.ro_bind(&script, "/xin/recipe.sh");
-            bw.bind(&work, "/xin/work");
-            bw.chdir("/xin/work");
-            bw.setenv("XIN_OUT", "/xin/out");
-            bw.setenv("XIN_PAYLOAD", "/xin/out/payload");
-            bw.setenv("XIN_INPUTS", "/xin/inputs/by-name");
-            bw.setenv("HOME", "/xin/work");
-            bw.command(&["bash", "/xin/recipe.sh"])
-        }
-    };
+    bw.bind(&out, "/xin/out");
+    bw.ro_bind(dir.join("inputs"), "/xin/inputs");
+    bw.ro_bind(&boot, "/xin/bootstrap");
+    bw.ro_bind(&script, "/xin/recipe.sh");
+    bw.bind(&work, "/xin/work");
+    bw.chdir("/xin/work");
+    bw.setenv("PATH", "/xin/bootstrap");
+    bw.setenv("XIN_OUT", "/xin/out");
+    bw.setenv("XIN_PAYLOAD", "/xin/out/payload");
+    bw.setenv("XIN_INPUTS", "/xin/inputs/by-name");
+    bw.setenv("HOME", "/xin/work");
+    let mut cmd = bw.command(&["/xin/bootstrap/sh", "/xin/recipe.sh"]);
     let result = cmd.output()?; // no timeout yet: prototype builder
     let log = BuildLog {
         stdout: result.stdout,

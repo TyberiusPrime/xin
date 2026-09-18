@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use xin_dag::config::{OnFailure, XinConfig};
 use xin_dag::schema::TomlStore;
-use xin_driver::{ContainerMode, ContainerPref};
+use xin_driver::Sandbox;
 use xin_resolver::input::{BuilderType, Cores};
 use xin_resolver::resolver::NodeStatus;
 use xin_resolver::sim::Policy;
@@ -58,9 +58,6 @@ enum Cmd {
         /// skip results/ symlinks and gc-root registration
         #[arg(long)]
         no_link: bool,
-        /// build isolation: auto (bwrap when available), bwrap, none
-        #[arg(long, value_name = "MODE")]
-        container: Option<String>,
     },
     /// Open an interactive container with a node and its runtime closure
     /// mounted at /xin/<output-hash> (realizes the node first if needed)
@@ -134,7 +131,6 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             keep_going,
             trace,
             no_link,
-            container,
         } => cmd_build(
             cli.format,
             config,
@@ -143,7 +139,6 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
             *keep_going,
             *trace,
             *no_link,
-            container.as_deref(),
         ),
         Cmd::Shell {
             node,
@@ -172,22 +167,17 @@ struct ResultLink {
 struct BuildReport {
     success: bool,
     policy: String,
-    /// how builds were isolated: "bwrap" or "none"
-    container: String,
+    /// the bootstrap busybox the (mandatory) sandbox used
+    bootstrap: String,
     builds_run: u32,
     nodes: Vec<report::NodeReport>,
     results: Vec<ResultLink>,
 }
 
-/// CLI flag beats config beats "auto"; then resolve against the host.
-fn container_mode(flag: Option<&str>, config: Option<&XinConfig>) -> Result<ContainerMode, String> {
-    let word = flag
-        .or(config.map(|c| c.container.as_str()))
-        .unwrap_or("auto");
-    let pref = ContainerPref::parse(word).ok_or_else(|| {
-        format!("container must be \"auto\", \"bwrap\" or \"none\", found {word:?}")
-    })?;
-    ContainerMode::detect(pref).map_err(|e| e.to_string())
+/// The mandatory build sandbox; config `bootstrap` beats $XIN_BOOTSTRAP
+/// beats PATH discovery of `busybox`.
+fn sandbox_for(config: Option<&XinConfig>) -> Result<Sandbox, String> {
+    Sandbox::detect(config.and_then(|c| c.bootstrap.as_deref())).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,12 +189,11 @@ fn cmd_build(
     keep_going: bool,
     trace: bool,
     no_link: bool,
-    container: Option<&str>,
 ) -> Result<ExitCode, String> {
     let config = load::load_config(config_arg)?;
     let loaded = load::load_bundle(file, config.as_ref())?;
     let mut driver = load::make_driver(&loaded.bundle).map_err(|e| e.to_string())?;
-    driver.container = container_mode(container, config.as_ref())?;
+    driver.sandbox = Some(sandbox_for(config.as_ref())?);
     let mut resolver = load::make_resolver(&loaded)?;
     resolver.trace.enabled = trace;
 
@@ -274,7 +263,11 @@ fn cmd_build(
             Policy::KeepGoing => "keep-going".into(),
             Policy::FailFast => "fail-fast".into(),
         },
-        container: driver.container.name().into(),
+        bootstrap: driver
+            .sandbox
+            .as_ref()
+            .map(|sb| sb.busybox.display().to_string())
+            .unwrap_or_default(),
         builds_run: driver.builds_run,
         nodes,
         results,
@@ -716,10 +709,11 @@ fn cmd_store(
 // ---------------------------------------------------------------- shell
 
 /// Realize one node (whatever the DAG's own targets say), then drop the
-/// user into a bwrap container whose /xin holds the node's entire runtime
-/// closure at the canonical relocatable places — the same view a build
-/// gets, plus network, the host cwd at /xin/work, and (by default) the
-/// host /nix so jupyter & friends are available (B8).
+/// user into a container whose /xin holds the node's entire runtime
+/// closure at the canonical relocatable places — the same world a build
+/// gets (bootstrap busybox on PATH, nothing of the host), plus network,
+/// the host cwd read-write at /xin/work, and — interactive convenience
+/// only, never for builds — the host /nix (B8) unless --no-nix.
 fn cmd_shell(
     config_arg: Option<&std::path::Path>,
     file: Option<&str>,
@@ -741,14 +735,9 @@ fn cmd_shell(
         return Err(format!("no node named {node} in {}", loaded.path.display()));
     }
 
-    let ContainerMode::Bwrap { bwrap } =
-        ContainerMode::detect(ContainerPref::Bwrap).map_err(|e| e.to_string())?
-    else {
-        unreachable!("ContainerPref::Bwrap never resolves to Direct");
-    };
-
+    let sandbox = sandbox_for(config.as_ref())?;
     let mut driver = load::make_driver(&loaded.bundle).map_err(|e| e.to_string())?;
-    driver.container = container_mode(None, config.as_ref())?;
+    driver.sandbox = Some(sandbox.clone());
     let mut resolver = load::make_resolver(&loaded)?;
     let out = xin_driver::run_to_quiescence(&mut resolver, &mut driver)
         .map_err(|e| format!("io error while realizing {node}: {e}"))?;
@@ -774,8 +763,16 @@ fn cmd_shell(
     let refs: Vec<&xin_driver::LocalStore> = stores.iter().collect();
     let closure = xin_driver::runtime_closure(&refs, *output);
 
-    let mut bw = xin_driver::Bwrap::new(&bwrap, true); // interactive: network stays
-    bw.host_toolchain(!no_nix);
+    // the bootstrap symlink farm needs a host dir to live in for the
+    // session; removed when the shell exits
+    let boot_stage = std::env::temp_dir().join(format!("xin-shell-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&boot_stage);
+    std::fs::create_dir_all(&boot_stage).map_err(|e| e.to_string())?;
+    let boot = sandbox
+        .stage_bootstrap(&boot_stage)
+        .map_err(|e| e.to_string())?;
+
+    let mut bw = xin_driver::Bwrap::new(&sandbox.bwrap, true); // interactive: network stays
     let mut node_dir = None;
     for oh in &closure {
         let dir = refs
@@ -790,6 +787,11 @@ fn cmd_shell(
         }
         bw.ro_bind(&dir, format!("/xin/{oh}"));
     }
+    bw.ro_bind(&boot, "/xin/bootstrap");
+    if !no_nix {
+        bw.ro_bind_try("/nix", "/nix");
+        bw.ro_bind_try("/run/current-system", "/run/current-system");
+    }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     bw.bind(&cwd, "/xin/work");
     bw.chdir("/xin/work");
@@ -798,14 +800,20 @@ fn cmd_shell(
     if let Ok(term) = std::env::var("TERM") {
         bw.setenv("TERM", term);
     }
-    // the node's own executables first on PATH, if it ships any
+    // PATH: the node's own executables, the bootstrap, and — only with
+    // /nix present to resolve into — the host PATH (jupyter & friends)
+    let mut path_parts = Vec::new();
     if node_dir.is_some_and(|d| d.join("payload").join("bin").is_dir()) {
-        let host_path = std::env::var("PATH").unwrap_or_default();
-        bw.setenv("PATH", format!("/xin/{output}/payload/bin:{host_path}"));
+        path_parts.push(format!("/xin/{output}/payload/bin"));
     }
+    path_parts.push("/xin/bootstrap".to_owned());
+    if !no_nix && let Ok(host_path) = std::env::var("PATH") {
+        path_parts.push(host_path);
+    }
+    bw.setenv("PATH", path_parts.join(":"));
 
     let argv: Vec<&str> = if cmd.is_empty() {
-        vec!["bash"]
+        vec!["sh"]
     } else {
         cmd.iter().map(String::as_str).collect()
     };
@@ -817,7 +825,9 @@ fn cmd_shell(
     let status = bw
         .command(&argv)
         .status()
-        .map_err(|e| format!("launching container: {e}"))?;
+        .map_err(|e| format!("launching container: {e}"));
+    let _ = std::fs::remove_dir_all(&boot_stage);
+    let status = status?;
     Ok(ExitCode::from(
         status.code().unwrap_or(1).clamp(0, 255) as u8
     ))
