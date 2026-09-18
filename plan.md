@@ -72,7 +72,9 @@ trust-on-first-use (TOFU).
 TOFU mismatches are immediate build failures. We keep the output (until next gc),
 but do not update the input->output matching.
 
-There is no 'no-input' node that is not a Fixed Output Derivation.
+There is no 'no-input' node. They all have at least the 'special inputs', 
+so even a node that just quines it's build script into the output has 
+it's own input hash.
 
 But the nodes are not just an url + the supposed output hash. 
 They also need a fetcher (fetchurl, fetchzip, fetchFromGithub...)
@@ -201,7 +203,7 @@ Remote retry configuration etc will be secondary.
 Same for 'should we keep partial result', we'll get there eventually.
 
 ## A8
-Conflicting information from stores on input->output mapping: 
+Conflicting information from stores (local or remote) on input->output mapping: 
 build failure. Ability to blacklist mappings for individual remote stores 
 necessary. That allows local rebuild.
 
@@ -275,6 +277,9 @@ by the upstream creating one node that writes everything, and then
 downstreams that symlink into that.
 So: No, one output per node. 
 
+## C0
+Human-names for nodes: Must not contain newlines. 
+Let's restrict them to /a-zA-Z0-9-/ for now.
 
 ## C1
 
@@ -304,12 +309,8 @@ Format:
 output-hash:nameA
 output-hash:nameB
 --
-value-hash:hash-of-buildScript
-value-hash:hash-of-env_vars
+<bytes for special input from the DAG definition layer 
 ```
-env_vars: sort, stringify (bash syntax), hash.
-other special inputs: hash their bytes.
-
 
 This insulates nodes from their changes in their grand+-parents,
 iff their parents do not change.
@@ -398,6 +399,10 @@ Builds happen in store/temp/<mkdtemp name> and get placed into their final desti
 after canonicalization. ENOTEMPTY is ok, that's a parallel build that was
 faster. Don't forget fsyncs. needs a reaping policy for crashed builds?
 
+ENOTEMPTYo on input->output mappings that do not lead to the same
+output-hash are undeterministic builds. Fail the nodes (and everything downstream)
+and complain very loudly.
+
 Failed builds stick around in a special store folder for inspection
 - maybe for a couple of invocations, but no longer than the next gc?
 
@@ -449,6 +454,9 @@ We then map these back into our containers at /nix/store .
 Note that the references might only work inside the container, 
 outside of the container nix might GC those paths. Won't affect our builds
 - we got our copy, but needs special handling during export.
+
+Relocability is only in scope for within-container representation, 
+best effort otherwise!
 
 ## B9
 Primary interface will be a single 'xin' command with subcommands.
@@ -531,7 +539,7 @@ cleaning up stores as a suprise.
 ## B15
 We will need a 'export everything into a new store, ready for reproduction'
 command eventually. But on the store / resolver side this is 
-just symlink chasing & copying it all together.
+just symlink chasing (possibly across secondary local stores) & copying it all together.
 
 Tying it together with the DAG creating code is outside of today's scope.
 
@@ -548,9 +556,14 @@ a post resolver decision.
 ## B18
 We need commands for validation-by-rebuild, validation-against-remote-store
 and similar to help the rebuilding.
+
 I'd also envision a chaos monkey style approach where we 'randomly' rebuild
 nodes in the graph (up to a maximum 'it takes this much extra time per build'
 policy) for verification.
+
+Failures get exposed to the user, they must fix their non-determinism.
+Keep multiple output-hash-keyede folders for output comparison, 
+GC will reap them eventually.
 
 
 ## B20
