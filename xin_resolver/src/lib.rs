@@ -25,6 +25,7 @@ pub mod input;
 pub mod resolver;
 pub mod sim;
 pub mod state;
+pub mod trace;
 pub mod transitions;
 
 pub use resolver::{NodeStatus, Outcome, Resolver};

@@ -462,3 +462,29 @@ fn fail_fast_facts_are_a_consistent_subset() {
         assert_eq!(out.failures[failure.idx()].kind, FailureKind::Build);
     }
 }
+
+#[test]
+fn trace_layer_records_a_readable_run() {
+    let raw = local_only(vec![
+        ("a", node("A", &[], false)),
+        ("b", node("rt:a", &[("a", "a")], true)),
+    ]);
+    let dag = raw.ingest().unwrap();
+    let mut r = Resolver::new(dag);
+    r.trace.enabled = true;
+    let mut w = SimWorld::new(&r.dag);
+    let out = drive(&mut r, &mut w, 7);
+    assert!(out.success);
+    let report = r.trace_report();
+    assert!(report.contains("named a"), "trace:\n{report}");
+    assert!(report.contains("named b"));
+    assert!(report.contains("StartBuild"));
+    assert!(report.contains("resolved"));
+    assert!(report.contains("realized"));
+    // and it is genuinely off by default: a fresh resolver records nothing
+    let raw = local_only(vec![("a", node("A", &[], true))]);
+    let mut r2 = Resolver::new(raw.ingest().unwrap());
+    let mut w2 = SimWorld::new(&r2.dag);
+    drive(&mut r2, &mut w2, 7);
+    assert!(r2.trace.entries.is_empty());
+}

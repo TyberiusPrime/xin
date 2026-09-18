@@ -23,8 +23,10 @@ use crate::state::{
     BuildPhase, Demand, DownloadPhase, Mapping, MappingSource, MappingState, NodeSlot, Realization,
     RealizationState, Reason, StoreKnowledge,
 };
+use crate::trace::{Trace, TraceEntry};
 use crate::transitions::{self, Classification};
 
+#[derive(Clone)]
 pub struct Resolver {
     pub dag: Dag,
     pub nodes: Vec<NodeSlot>,
@@ -33,6 +35,8 @@ pub struct Resolver {
     pub knowledge: StoreKnowledge,
     pub inflight: BTreeMap<RequestId, Inflight>,
     pub failures: Vec<FailureRecord>,
+    /// structured trace buffer; off by default (see `trace` module)
+    pub trace: Trace,
     next_tok: u64,
     /// the host has cancelled at least one request (fail-fast drain);
     /// quiescence may then legitimately leave entries parked mid-machine
@@ -145,6 +149,7 @@ impl Resolver {
             knowledge: StoreKnowledge::default(),
             inflight: BTreeMap::new(),
             failures: Vec::new(),
+            trace: Trace::default(),
             next_tok: 0,
             saw_cancel: false,
         }
@@ -159,6 +164,11 @@ impl Resolver {
         for i in 0..self.dag.nodes.len() {
             if self.nodes[i].unnamed_upstreams == 0 {
                 self.name_node(NodeId(i as u32), &mut fx);
+            }
+        }
+        if self.trace.enabled {
+            for e in &fx {
+                self.trace.push(TraceEntry::Emit(e.clone()));
             }
         }
         fx
@@ -179,6 +189,9 @@ impl Resolver {
             }
         }
         self.check_state_legality(tok);
+        if self.trace.enabled {
+            self.trace.push(TraceEntry::Apply(ev.clone()));
+        }
         let mut fx = Vec::new();
         match ev {
             Event::MappingAnswered { tok, output } => {
@@ -197,6 +210,11 @@ impl Resolver {
                 self.on_mapping_committed(tok, result, &mut fx)
             }
             Event::Cancelled { tok } => self.on_cancelled(tok, &mut fx),
+        }
+        if self.trace.enabled {
+            for e in &fx {
+                self.trace.push(TraceEntry::Emit(e.clone()));
+            }
         }
         fx
     }
@@ -264,6 +282,10 @@ impl Resolver {
             input_hash_of(&inputs, &dn.recipe)
         };
         self.nodes[id.idx()].input_hash = Some(ih);
+        self.trace.push(TraceEntry::NodeNamed {
+            node: id,
+            input: ih,
+        });
 
         if let Some(m) = self.mappings.get_mut(&ih) {
             // A7 DAG collapse: a byte-identical recipe with identical inputs
@@ -413,6 +435,11 @@ impl Resolver {
         src: MappingSource,
         fx: &mut Vec<Effect>,
     ) {
+        self.trace.push(TraceEntry::MappingResolved {
+            input: ih,
+            output: oh,
+            source: src.clone(),
+        });
         let prev = self.knowledge.facts.insert(ih, (oh, src));
         assert!(
             prev.is_none_or(|(p, _)| p == oh),
@@ -706,6 +733,7 @@ impl Resolver {
     /// An output's whole runtime closure is now locally present: notify
     /// everything that was waiting.
     fn on_realized(&mut self, oh: OutputHash, fx: &mut Vec<Effect>) {
+        self.trace.push(TraceEntry::Realized { output: oh });
         let reasons: Vec<Reason> = self.realizations[&oh].demand.iter().copied().collect();
         for reason in reasons {
             self.notify_reason(oh, reason, fx);
@@ -1052,6 +1080,11 @@ impl Resolver {
                     self.learn_runtime_refs(output, runtime_refs, RefsSource::Built, fx);
                     if known_output.is_none() {
                         // first resolution: record the fact, cascade names
+                        self.trace.push(TraceEntry::MappingResolved {
+                            input: ih,
+                            output,
+                            source: MappingSource::Built(builder),
+                        });
                         let prev = self
                             .knowledge
                             .facts
@@ -1228,6 +1261,11 @@ impl Resolver {
         detail: FailureDetail,
     ) -> FailureId {
         let fid = FailureId(self.failures.len() as u32);
+        self.trace.push(TraceEntry::FailureRecorded {
+            id: fid,
+            kind,
+            origin,
+        });
         self.failures.push(FailureRecord {
             kind,
             origin,
@@ -1426,6 +1464,11 @@ impl Resolver {
             }
         }
         Some(out)
+    }
+
+    /// Render the recorded trace with human node names.
+    pub fn trace_report(&self) -> String {
+        crate::trace::render(&self.dag, &self.trace.entries)
     }
 
     fn store_rank(&self, s: &StoreName) -> usize {
