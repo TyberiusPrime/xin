@@ -1,1 +1,4 @@
 target*/
+# example working state — created by running the examples
+examples/*/store/
+examples/*/results/

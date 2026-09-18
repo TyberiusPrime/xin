@@ -402,3 +402,86 @@ fn build_without_a_sandbox_is_an_error_not_a_fallback() {
     };
     assert!(err.to_string().contains("unsandboxed"), "{err}");
 }
+
+// ------------------------------------------------------------- fetchurl
+
+fn fetch_node(url: &str, target: bool) -> RawNode {
+    RawNode {
+        builder: BuilderType::FetchUrl,
+        recipe: url.as_bytes().to_vec(),
+        is_target: target,
+        target_store: None,
+        remotes: ValidRemoteStores::All,
+        upstreams: Vec::new(),
+        cores: Cores::One,
+    }
+}
+
+#[test]
+fn fetchurl_is_tofu_pinned() {
+    let td = TestDir::new("fetch_tofu");
+    let src = td.path.join("dataset.csv");
+    fs::write(&src, "a,b\n1,2\n").unwrap();
+    let url = format!("file://{}", src.display());
+
+    // first fetch: trust on first use — the content gets pinned
+    let (r, d, out) =
+        resolve(raw(vec![("data", fetch_node(&url, true))]), driver_for(&td)).unwrap();
+    assert!(out.success, "failures: {:?}", out.failures);
+    assert_eq!(d.builds_run, 1);
+    let oh = realized_output(&out.statuses[r.dag.id_of("data").unwrap().idx()]);
+    let ih = r.nodes[0].input_hash.unwrap();
+    let payload = d.local(&sn("primary")).output_dir(oh).join("payload");
+    assert_eq!(
+        fs::read_to_string(payload.join("dataset.csv")).unwrap(),
+        "a,b\n1,2\n"
+    );
+
+    // upstream drift changes nothing: mapping + bytes are pinned, no refetch
+    fs::write(&src, "a,b\n9,9\n").unwrap();
+    let (_, d2, out2) =
+        resolve(raw(vec![("data", fetch_node(&url, true))]), driver_for(&td)).unwrap();
+    assert!(out2.success);
+    assert_eq!(d2.builds_run, 0, "a pinned fetch must not re-run");
+    assert_eq!(
+        fs::read_to_string(payload.join("dataset.csv")).unwrap(),
+        "a,b\n1,2\n",
+        "the pinned content wins over upstream drift"
+    );
+
+    // surgery: the bytes vanish but the pinned mapping survives; the
+    // refetch reproduces *different* bytes => TofuMismatch (A2), and the
+    // recorded mapping is NOT silently moved to the new content
+    fs::remove_dir_all(d.local(&sn("primary")).output_dir(oh)).unwrap();
+    let (_, _, out3) =
+        resolve(raw(vec![("data", fetch_node(&url, true))]), driver_for(&td)).unwrap();
+    assert!(!out3.success);
+    assert!(
+        out3.failures
+            .iter()
+            .any(|f| f.kind == FailureKind::TofuMismatch),
+        "failures: {:?}",
+        out3.failures
+    );
+    assert_eq!(
+        d.local(&sn("primary")).lookup_mapping(ih).unwrap(),
+        Some(oh),
+        "A2: a TOFU mismatch must not update the input->output mapping"
+    );
+}
+
+#[test]
+fn fetchurl_rejects_unknown_schemes_with_a_build_failure() {
+    let td = TestDir::new("fetch_bad_scheme");
+    let (_, _, out) = resolve(
+        raw(vec![("data", fetch_node("gopher://old.example/x", true))]),
+        driver_for(&td),
+    )
+    .unwrap();
+    assert!(!out.success);
+    assert!(
+        out.failures.iter().any(|f| f.kind == FailureKind::Build),
+        "failures: {:?}",
+        out.failures
+    );
+}

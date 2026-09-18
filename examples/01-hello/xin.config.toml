@@ -1,0 +1,5 @@
+# Where outputs live. Paths are relative to this file, so it does not
+# matter where you invoke xin from.
+[stores.main]
+type = "local"
+path = "./store"

@@ -17,7 +17,7 @@ use xin_resolver::resolver::Outcome;
 use xin_resolver::sim::Policy;
 use xin_resolver::{Resolver, failure::BuildLog};
 
-use crate::builder::{BuildRun, run_process_build};
+use crate::builder::{BuildRun, run_fetch_url, run_process_build};
 use crate::container::Sandbox;
 use crate::local_store::LocalStore;
 
@@ -190,14 +190,31 @@ impl Driver {
                         }
                         outcome
                     }
-                    BuilderType::FetchUrl => xin_resolver::events::BuildOutcome::Failure {
-                        log: BuildLog {
-                            stdout: Vec::new(),
-                            stderr: b"xin: FetchUrl builder not implemented in the driver yet"
-                                .to_vec(),
-                            return_code: -1,
-                        },
-                    },
+                    BuilderType::FetchUrl => {
+                        let sandbox = self.sandbox.clone().ok_or_else(|| {
+                            io::Error::other(
+                                "a fetch was demanded but no sandbox is configured; \
+                                 builds never run unsandboxed (Sandbox::detect)",
+                            )
+                        })?;
+                        let target = self.local_mut(&store);
+                        let BuildRun {
+                            outcome,
+                            build_dir,
+                            staged_out,
+                        } = run_fetch_url(target, input, &recipe, &sandbox)?;
+                        if let xin_resolver::events::BuildOutcome::Success { output, .. } = &outcome
+                        {
+                            self.staged.insert(
+                                *output,
+                                Staged {
+                                    out: staged_out.unwrap(),
+                                    build_dir: Some(build_dir),
+                                },
+                            );
+                        }
+                        outcome
+                    }
                 };
                 // meta is fire-and-forget (§6): losing a log is harmless
                 let log = match &outcome {

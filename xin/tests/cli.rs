@@ -335,3 +335,42 @@ test ! -e "{host}"
     let out = t.xin(&["shell", "nonesuch", "demo"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn shipped_examples_evaluate() {
+    // bit-rot guard: every example's Nickel file must evaluate to a valid
+    // TOML intermediary (building them is the READMEs' job)
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+    let mut seen = 0;
+    for entry in fs::read_dir(&examples).unwrap() {
+        let dir = entry.unwrap().path();
+        if !dir.is_dir() {
+            continue;
+        }
+        for f in fs::read_dir(&dir).unwrap() {
+            let f = f.unwrap().path();
+            if f.to_str().is_some_and(|p| p.ends_with(".xin.ncl")) {
+                let out = Command::new(env!("CARGO_BIN_EXE_xin"))
+                    .args(["eval", f.to_str().unwrap()])
+                    .current_dir(&dir)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}: {}",
+                    f.display(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let text = String::from_utf8(out.stdout).unwrap();
+                let parsed: toml::Value = toml::from_str(&text).unwrap();
+                assert!(
+                    parsed.get("nodes").is_some(),
+                    "{}: intermediary has no nodes",
+                    f.display()
+                );
+                seen += 1;
+            }
+        }
+    }
+    assert!(seen >= 4, "expected the shipped examples, found {seen}");
+}

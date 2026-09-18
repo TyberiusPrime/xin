@@ -1,0 +1,8 @@
+# Policy lives here, not in the DAG: the same pipeline file runs
+# unchanged on a machine with different stores or failure policy.
+# (TOML: top-level keys must come before the first [table].)
+on_failure = "keep-going"   # or "fail-fast"
+
+[stores.main]
+type = "local"
+path = "./store"

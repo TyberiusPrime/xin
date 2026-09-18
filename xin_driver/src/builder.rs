@@ -107,8 +107,13 @@ pub fn run_process_build(
         stderr: result.stderr,
         return_code: result.status.code().unwrap_or(-1),
     };
+    finish_build(dir, out, log, result.status.success())
+}
 
-    if !result.status.success() {
+/// The shared back half of every builder: read the declared refs back
+/// (B2/B1 lint) and tree-hash the staged output into its name (B12).
+fn finish_build(dir: PathBuf, out: PathBuf, log: BuildLog, ran_ok: bool) -> io::Result<BuildRun> {
+    if !ran_ok {
         return Ok(BuildRun {
             outcome: BuildOutcome::Failure { log },
             build_dir: dir,
@@ -141,4 +146,108 @@ pub fn run_process_build(
         build_dir: dir,
         staged_out: Some(out),
     })
+}
+
+/// The FetchUrl builder (A2): recipe = a URL, output = payload/<basename>,
+/// no runtime refs. `file://` copies from the host — a fetcher's whole job
+/// is to bring the outside world in, and TOFU (the resolver pins the first
+/// fetch's output-hash) is the guard rail, not the sandbox. `http(s)://`
+/// runs busybox wget in a *network-enabled* sandbox (fixed-output nodes
+/// are the one class allowed network, B3), with only resolv.conf and the
+/// CA bundle from the host.
+pub fn run_fetch_url(
+    store: &mut LocalStore,
+    input: InputHash,
+    recipe: &[u8],
+    sandbox: &Sandbox,
+) -> io::Result<BuildRun> {
+    let ih_short = &input.to_string()[..8];
+    let dir = store.new_temp_dir(&format!("fetch-{ih_short}"))?;
+    let out = dir.join("out");
+    std::fs::create_dir_all(out.join("payload"))?;
+    std::fs::create_dir_all(out.join("runtime-inputs"))?;
+    let url = String::from_utf8_lossy(recipe).trim().to_string();
+    let name = fetch_basename(&url);
+    let dest = out.join("payload").join(&name);
+
+    let fail = |dir: PathBuf, msg: String| {
+        Ok(BuildRun {
+            outcome: BuildOutcome::Failure {
+                log: BuildLog {
+                    stdout: Vec::new(),
+                    stderr: msg.into_bytes(),
+                    return_code: -1,
+                },
+            },
+            build_dir: dir,
+            staged_out: None,
+        })
+    };
+
+    if let Some(path) = url.strip_prefix("file://") {
+        return match std::fs::copy(path, &dest) {
+            Ok(_) => finish_build(
+                dir,
+                out,
+                BuildLog {
+                    stdout: format!("fetched {url} -> payload/{name}\n").into_bytes(),
+                    stderr: Vec::new(),
+                    return_code: 0,
+                },
+                true,
+            ),
+            Err(e) => fail(dir, format!("xin: fetch {url}: {e}")),
+        };
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return fail(
+            dir,
+            format!("xin: fetchurl supports file://, http:// and https://, got {url:?}"),
+        );
+    }
+
+    let boot = sandbox.stage_bootstrap(&dir)?;
+    let mut bw = Bwrap::new(&sandbox.bwrap, true); // fixed-output: network allowed
+    bw.bind(&out, "/xin/out");
+    bw.ro_bind(&boot, "/xin/bootstrap");
+    bw.ro_bind_try("/etc/resolv.conf", "/etc/resolv.conf");
+    bw.ro_bind_try("/etc/ssl", "/etc/ssl");
+    bw.setenv("PATH", "/xin/bootstrap");
+    bw.setenv("HOME", "/tmp");
+    let mut cmd = bw.command(&[
+        "/xin/bootstrap/wget",
+        "-O",
+        &format!("/xin/out/payload/{name}"),
+        &url,
+    ]);
+    let result = cmd.output()?;
+    let log = BuildLog {
+        stdout: result.stdout,
+        stderr: result.stderr,
+        return_code: result.status.code().unwrap_or(-1),
+    };
+    if !result.status.success() {
+        // wget leaves an empty -O file behind on failure; drop it
+        let _ = std::fs::remove_file(&dest);
+    }
+    finish_build(dir, out, log, result.status.success())
+}
+
+/// A deterministic payload filename from the URL's last path segment.
+fn fetch_basename(url: &str) -> String {
+    let no_query = url.split(['?', '#']).next().unwrap_or(url);
+    let seg = no_query
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let cleaned: String = seg
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        "fetched".to_owned()
+    } else {
+        cleaned
+    }
 }
