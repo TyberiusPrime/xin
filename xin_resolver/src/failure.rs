@@ -60,9 +60,19 @@ pub enum FailureDetail {
     ConflictingAnswers(Vec<(StoreName, OutputHash)>),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BuildLog {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub return_code: i32,
+}
+
+impl std::fmt::Debug for BuildLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildLog")
+            .field("stdout", &String::from_utf8_lossy(&self.stdout))
+            .field("stderr", &String::from_utf8_lossy(&self.stderr))
+            .field("return_code", &self.return_code)
+            .finish()
+    }
 }

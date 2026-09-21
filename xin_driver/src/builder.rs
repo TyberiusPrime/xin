@@ -101,6 +101,7 @@ pub fn run_process_build(
     bw.setenv("XIN_INPUTS", "/xin/inputs/by-name");
     bw.setenv("HOME", "/xin/work");
     let mut cmd = bw.command(&["/xin/bootstrap/sh", "/xin/recipe.sh"]);
+    xin_misc::format::pretty_debug_cmd(&cmd);
     let result = cmd.output()?; // no timeout yet: prototype builder
     let log = BuildLog {
         stdout: result.stdout,
@@ -109,6 +110,7 @@ pub fn run_process_build(
     };
     finish_build(dir, out, log, result.status.success())
 }
+
 
 /// The shared back half of every builder: read the declared refs back
 /// (B2/B1 lint) and tree-hash the staged output into its name (B12).

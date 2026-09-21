@@ -82,7 +82,7 @@
             name = "xin";
             tag = "latest";
             contents = [
-              pkgs.busybox
+              pkgs.pkgsStatic.busybox
               pkgs.glibc
               pkgs.hdf5
               binary
@@ -112,17 +112,20 @@
 
         # Cross-check every xin export against anndata itself.
         # Runs via `nix flake check`.
-        checks.pytest = pkgs.runCommand "xin-pytest" {
-          buildInputs = [
-            mypython
-            packages.xin
-          ];
-          xin_BIN = "${packages.xin}/bin/xin";
-        } ''
-          export HOME="$TMPDIR"
-          ${mypython}/bin/python -m pytest ${./tests} -q -p no:cacheprovider --tb=short
-          touch "$out"
-        '';
+        checks.pytest =
+          pkgs.runCommand "xin-pytest"
+            {
+              buildInputs = [
+                mypython
+                packages.xin
+              ];
+              xin_BIN = "${packages.xin}/bin/xin";
+            }
+            ''
+              export HOME="$TMPDIR"
+              ${mypython}/bin/python -m pytest ${./tests} -q -p no:cacheprovider --tb=short
+              touch "$out"
+            '';
 
         defaultPackage = packages.xin;
 
@@ -132,6 +135,7 @@
         devShell = pkgs.mkShell {
           shellHook = ''
             #export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            export XIN_BOOTSTRAP=${pkgs.pkgsStatic.busybox}/bin/busybox
           '';
           nativeBuildInputs = [
             pkgs.bacon
@@ -139,12 +143,14 @@
             pkgs.cargo-nextest
             #pkgs.mold
             #pkgs.pkg-config
-            # xin's build-sandbox bootstrap: a full static busybox
-            pkgs.pkgsStatic.busybox
             pkgs.ripgrep
             mypython
             rust
           ];
+          # buildInputs = [
+          #   # xin's build-sandbox bootstrap: a full static busybox
+          #   pkgs.pkgsStatic.busybox
+          # ];
         };
       }
     );

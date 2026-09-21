@@ -1561,8 +1561,13 @@ name = "xin_driver"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "xin_misc",
  "xin_resolver",
 ]
+
+[[package]]
+name = "xin_misc"
+version = "0.1.0"
 
 [[package]]
 name = "xin_resolver"

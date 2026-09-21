@@ -1,4 +1,4 @@
 [workspace]
 resolver = "3"
-members = ["xin", "xin_dag", "xin_driver", "xin_resolver"]
+members = ["xin", "xin_misc", "xin_dag", "xin_driver", "xin_resolver"]
 

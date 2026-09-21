@@ -53,14 +53,14 @@ fn sn(s: &str) -> StoreName {
     StoreName::new(s).unwrap()
 }
 
-fn node(recipe: &str, ups: &[(&str, &str)], target: bool) -> RawNode {
+fn node(recipe: &str, upstreams: &[(&str, &str)], target: bool) -> RawNode {
     RawNode {
         builder: BuilderType::Process,
         recipe: recipe.as_bytes().to_vec(),
         is_target: target,
         target_store: None,
         remotes: ValidRemoteStores::All,
-        upstreams: ups
+        upstreams: upstreams
             .iter()
             .map(|(a, u)| (InputName::new(a).unwrap(), hn(u)))
             .collect(),
