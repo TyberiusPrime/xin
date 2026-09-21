@@ -101,7 +101,7 @@ pub fn run_process_build(
     bw.setenv("XIN_INPUTS", "/xin/inputs/by-name");
     bw.setenv("HOME", "/xin/work");
     let mut cmd = bw.command(&["/xin/bootstrap/sh", "/xin/recipe.sh"]);
-    xin_misc::format::pretty_debug_cmd(&cmd);
+    //xin_misc::format::pretty_debug_cmd(&cmd);
     let result = cmd.output()?; // no timeout yet: prototype builder
     let log = BuildLog {
         stdout: result.stdout,

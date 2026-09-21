@@ -1,0 +1,28 @@
+- for every run, we need to log the input tomls, extend them by the 
+  the input-name->by-input mapping and this will also be our back channel for 
+  TOFU!
+
+- generated toml needs indentation!
+
+- we need a 'record runtime input' helper script inside the containers
+  as part of our prelude
+
+
+- how do we actually build a PATH, or find our nix python things...
+  answer: by their name!
+
+
+- interactive, --nix=false must be default, --nix then adds it in impurely...
+
+- how do I define a nix node?
+  Yeah, we're essentially missing that completely.
+  yeah, no B8 implementation at all. 
+  Guess that's my first real job in this codebase.
+
+- how do I configure stores
+
+- how do we actually host web-based stores?
+
+- web stores: figure out a push story from like day 2.
+  this is vital for the prolonged sucess and one major issue with 
+  nix going from 'share a build script' to 'share the damn build artifacts'

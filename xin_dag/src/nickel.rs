@@ -17,8 +17,9 @@ use xin_resolver::hashes::hash_bytes;
 
 use crate::DagError;
 
-pub const PRELUDE: &str = include_str!("../assets/xin.ncl");
+pub const PRELUDE: &'static str = include_str!("../assets/xin.ncl");
 pub const PRELUDE_FILE: &str = "xin.ncl";
+
 
 /// Materialize the prelude so `import "xin.ncl"` resolves. The directory is
 /// keyed by the prelude's own hash, so concurrent versions never clash and

@@ -78,11 +78,18 @@ enum Cmd {
         trace: bool,
     },
     /// Print the TOML intermediary a DAG file evaluates to
-    Eval { file: Option<String> },
+    Eval {
+        file: Option<String>,
+    },
     /// Show the pruned, validated DAG
-    Dag { file: Option<String> },
+    Dag {
+        file: Option<String>,
+    },
     /// Show the stored build log of a node
-    Log { node: String, file: Option<String> },
+    Log {
+        node: String,
+        file: Option<String>,
+    },
     /// Remove store paths unreachable from results links and live leases
     Gc {
         /// report what would be deleted without deleting
@@ -94,6 +101,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: StoreCmd,
     },
+    /// Show the nickel prelude
+    Prelude {},
 }
 
 #[derive(Subcommand)]
@@ -152,6 +161,7 @@ fn run(cli: &Cli) -> Result<ExitCode, String> {
         Cmd::Log { node, file } => cmd_log(cli.format, config, file.as_deref(), node),
         Cmd::Gc { dry_run } => cmd_gc(cli.format, config, *dry_run),
         Cmd::Store { cmd } => cmd_store(cli.format, config, cmd),
+        Cmd::Prelude { } => cmd_prelude(),
     }
 }
 
@@ -703,6 +713,11 @@ fn cmd_store(
         }
     }
     emit(format, &reports, human);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_prelude() -> Result<ExitCode, String> {
+    println!("{}", xin_dag::nickel::PRELUDE);
     Ok(ExitCode::SUCCESS)
 }
 
