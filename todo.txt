@@ -1,5 +1,5 @@
 - for every run, we need to log the input tomls, extend them by the 
-  the input-name->by-input mapping and this will also be our back channel for 
+  the input-name->by-input mapping and this will also be our eventual back channel for 
   TOFU!
 
 - generated toml needs indentation!
@@ -7,6 +7,8 @@
 - we need a 'record runtime input' helper script inside the containers
   as part of our prelude
 
+
+- do we log build times? (can we log resource consumption?).
 
 - how do we actually build a PATH, or find our nix python things...
   answer: by their name!
@@ -19,10 +21,47 @@
   yeah, no B8 implementation at all. 
   Guess that's my first real job in this codebase.
 
+- we don't have the 'in-place-import' either.
+
 - how do I configure stores
+  xin.config.toml stores.name...
 
 - how do we actually host web-based stores?
 
 - web stores: figure out a push story from like day 2.
   this is vital for the prolonged sucess and one major issue with 
   nix going from 'share a build script' to 'share the damn build artifacts'
+
+- how do I set the store on a node. Setting 'store' did not work.
+  it's 'target_store'... meh.
+
+- no such store, list stores.
+
+
+- moving existng job to (new) local store,
+  nothing get's stored in the new local store.
+  (but it's not primary, so kinda expected?)
+- but running it with empty stores doesn't get me the link I was expecting
+  in the primary store either.
+  guess we're missing something there.
+
+-wait if we don't carry back the TOFU hash to the definition,
+ why does it not rerun the output when we change the input file,
+ since it must retofu when size changed...
+ because it's an url, file, and why would it rerun then.
+ So how do you trigger a redownload? break the tofu hash, like nix does?
+ lol, we don't even have that on our schema!
+
+
+- what is the difference between gc-protect and gc-roots, what do these do?
+  
+- store transfer commands?
+
+--dag command must suport some of the usual graph standards.
+
+-- how can we help the user remove unecssary inputs - missing ones will 
+always explode, but superflous ones? That's a genuine issue. 
+Don't see how we can measure those without tracking every access though. 
+
+
+-- use systemd-run to capture resource usage.
